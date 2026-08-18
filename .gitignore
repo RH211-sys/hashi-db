@@ -1,0 +1,27 @@
+# ============ 构建产物 ============
+out/
+build/
+cmake-build-*/
+
+# ============ Visual Studio / CMake Tools ============
+.vs/
+*.user
+*.suo
+
+# ============ 编译器产物 ============
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.dll
+
+# ============ VS Code（保留 settings/tasks 便于共享）============
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+
+# ============ 系统文件 ============
+.DS_Store
+Thumbs.db
