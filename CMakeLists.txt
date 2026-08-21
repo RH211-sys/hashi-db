@@ -31,7 +31,7 @@ file(GLOB_RECURSE MYDB_SOURCES
 )
 
 # ============ 生成可执行文件 ============
-add_executable(myDB ${MYDB_SOURCES})
+add_executable(myDB ${MYDB_SOURCES} "project/data_memo_level/cache/cache.cpp" "project/data_memo_level/data_type.h" "project/data_memo_level/disk/disk.cpp")
 
 # 头文件搜索路径：代码统一在 project/ 下，include 时从层名开始写
 # 例如 #include "data_memo_level/memory/memo.h"
