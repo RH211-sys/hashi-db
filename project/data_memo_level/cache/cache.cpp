@@ -7,7 +7,11 @@ Cache::Cache(long long memoSize)
 	this->curSize = 0;
 }
 
-int Cache::selData(const std::string& varName)
+void Cache::setDisk(Disk* d)
+{
+}
+
+int Cache::selData(const std::string& varName, std::any& res)
 {
 	return 0;
 }

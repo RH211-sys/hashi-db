@@ -4,6 +4,10 @@ Disk::Disk(const long long& maxSize)
 {
 }
 
+void Disk::setCache(Cache* c)
+{
+}
+
 int Disk::delData(const std::string& varName)
 {
     return 0;

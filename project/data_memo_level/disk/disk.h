@@ -12,12 +12,14 @@ class Cache;
 class Disk {
 	friend class Cache;
 private:
+	Cache* cache = nullptr;	// 缓存对象指针（由上层绑定）
 	long long maxSize;
 	std::unordered_map<std::string, int> inDisk;		// 变量名 + 偏移量
 	std::unordered_set<std::string> delDisk;			// 待删除的变量名
 
 public:
 	explicit Disk(const long long& maxSize);
+	void setCache(Cache* c);	// 绑定缓存对象
 	// 删除某变量
 	int delData(const std::string& varName);
 	// 持久化某变量

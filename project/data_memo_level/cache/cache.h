@@ -11,12 +11,14 @@ class Disk;
 class Cache {
 	friend class Disk;
 private:
+	Disk* disk = nullptr;	// 磁盘对象指针（由上层绑定）
 	long long memoSize;	// 缓存大小设定值
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache;      // <变量名，值>
 
 public:
 	Cache(long long memoSize);
+	void setDisk(Disk* d);	// 绑定磁盘对象
 
 	// 新增数据
 	template <typename T>
@@ -32,8 +34,8 @@ public:
 	template <typename T>
 	int modData(const std::string& varName, std::string& member, const T& entity);
 
-	// 查找
-	int selData(const std::string& varName);
+	// 查找，结果写入 res
+	int selData(const std::string& varName, std::any& res);
 
 	// 单个变量持久化
 	int persisVar(const std::string& varName);
