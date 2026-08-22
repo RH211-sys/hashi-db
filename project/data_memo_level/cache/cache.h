@@ -14,7 +14,7 @@ private:
 	Disk* disk = nullptr;	// 磁盘对象指针（由上层绑定）
 	long long memoSize;	// 缓存大小设定值
 	long long curSize;	// 当前缓存大小
-	std::unordered_map<std::string, Val> cache;      // <变量名，值>
+	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
 
 public:
 	Cache(long long memoSize);

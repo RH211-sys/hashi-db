@@ -1,6 +1,6 @@
 #include "disk.h"
 
-Disk::Disk(const long long& maxSize)
+Disk::Disk(const long long& maxSize, std::string& dbName)
 {
 }
 
