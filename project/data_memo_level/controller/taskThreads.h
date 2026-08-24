@@ -14,7 +14,9 @@
 	写任务不走这里（写单线程串行），磁盘任务不走这里（磁盘单线程）
 	读任务对象由上层封装，这里只负责取任务 -> 执行回调
 */
-class readPool {
+class ReadPool {
+	friend class DiskThread;
+	friend class WriteThread;
 private:
 	std::vector<std::thread> workers;				// 工作线程集合
 	std::queue<std::function<void()>> tasks;		// 读任务队列
@@ -56,16 +58,16 @@ private:
 
 public:
 	// threadNum：工作线程数量（读写差距阈值放行的批大小 = 线程数）
-	explicit readPool(size_t threadNum = 4) {
+	explicit ReadPool(size_t threadNum = 4) {
 		workers.reserve(threadNum);
 		for (size_t i = 0; i < threadNum; ++i) {
-			workers.emplace_back(&readPool::work, this);
+			workers.emplace_back(&ReadPool::work, this);
 		}
 	}
 
 	// 析构：停止接收新任务，处理完队列中已有任务后退出所有工作线程
 	// 注意：已提交的读任务不能丢弃，否则上层 future 无人兑现，这里选择处理完再退
-	~readPool() {
+	~ReadPool() {
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 			stop = true;
@@ -76,8 +78,8 @@ public:
 		}
 	}
 
-	readPool(const readPool&) = delete;
-	readPool& operator=(const readPool&) = delete;
+	ReadPool(const ReadPool&) = delete;
+	ReadPool& operator=(const ReadPool&) = delete;
 
 	// 提交读任务，立即返回，由空闲工作线程异步执行回调
 	// future 扩展：后续读任务需要拿结果时，在此新增返回 future 的接口
@@ -104,7 +106,9 @@ public:
 	写必须串行（避免unordered_map 结构竞争 + rehash 迭代器失效），天然无需任务锁
 	写任务对象由其他模块封装，这里只负责取任务 -> 执行回调
 */
-class writeThread {
+class WriteThread {
+	friend class ReadPool;
+	friend class DiskThread;
 private:
 	std::thread worker;								// 写线程
 	std::queue<std::function<void()>> tasks;		// 写任务队列
@@ -135,13 +139,13 @@ private:
 	}
 
 public:
-	writeThread() {
-		worker = std::thread(&writeThread::work, this);
+	WriteThread() {
+		worker = std::thread(&WriteThread::work, this);
 	}
 
 	// 析构：停止接收新任务，处理完队列中已有任务后退出
 	// 注意：写任务不能丢弃（脏数据落盘任务丢了会丢数据），处理完再退
-	~writeThread() {
+	~WriteThread() {
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 			stop = true;
@@ -151,8 +155,8 @@ public:
 	}
 
 	// 防止线程对象进行拷贝构造
-	writeThread(const writeThread&) = delete;
-	writeThread& operator=(const writeThread&) = delete;
+	WriteThread(const WriteThread&) = delete;
+	WriteThread& operator=(const WriteThread&) = delete;
 
 	// 提交写任务，立即返回，由写线程串行执行
 	void push(std::function<void()> task) {
@@ -173,7 +177,9 @@ public:
 	inDisk/delDisk/文件只有本线程访问，天然串行，无需锁
 	磁盘任务对象由上层封装，这里只负责取任务 -> 执行回调
 */
-class diskThread {
+class DiskThread {
+	friend class ReadPool;
+	friend class WriteThread;
 private:
 	std::thread worker;								// 磁盘单线程
 	std::queue<std::function<void()>> tasks;		// 磁盘任务队列
@@ -204,13 +210,13 @@ private:
 	}
 
 public:
-	diskThread() {
-		worker = std::thread(&diskThread::work, this);
+	DiskThread() {
+		worker = std::thread(&DiskThread::work, this);
 	}
 
 	// 析构：停止接收新任务，处理完队列中已有任务后退出
 	// 注意：磁盘任务不能丢弃（刷盘/重写丢了数据不完整），处理完再退
-	~diskThread() {
+	~DiskThread() {
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 			stop = true;
@@ -219,8 +225,8 @@ public:
 		worker.join();
 	}
 
-	diskThread(const diskThread&) = delete;
-	diskThread& operator=(const diskThread&) = delete;
+	DiskThread(const DiskThread&) = delete;
+	DiskThread& operator=(const DiskThread&) = delete;
 
 	// 提交磁盘任务，立即返回，由磁盘线程串行执行
 	void push(std::function<void()> task) {
