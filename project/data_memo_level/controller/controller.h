@@ -4,14 +4,14 @@
 
 #include "../cache/cache.h"
 #include "../disk/disk.h"
-#include "threadPool.h"
+#include "taskThreads.h"
 #include <memory>
 
 class Controller {
 private:
 	std::unique_ptr<Cache> cache;		// 持有缓存对象
 	std::unique_ptr<Disk> disk;			// 持有磁盘对象
-	std::unique_ptr<ThreadPool> pool;	// 并发任务入口
+	std::unique_ptr<readPool> readPool;		// 读并发任务入口
 public:
 	Controller(long long memoSize, long long maxSize, size_t poolThreadNum);
 
