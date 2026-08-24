@@ -9,9 +9,12 @@
 
 class Controller {
 private:
-	std::unique_ptr<Cache> cache;		// 持有缓存对象
-	std::unique_ptr<Disk> disk;			// 持有磁盘对象
-	std::unique_ptr<readPool> readPool;		// 读并发任务入口
+	std::unique_ptr<Cache> cache;				// 持有缓存对象
+	std::unique_ptr<Disk> disk;					// 持有磁盘对象
+	std::unique_ptr<ReadPool> readPool;			// 读并发任务入口
+	std::unique_ptr<WriteThread> writeThread;	// 写任务
+	std::unique_ptr<DiskThread> diskThread;		// 磁盘任务
+
 public:
 	Controller(long long memoSize, long long maxSize, size_t poolThreadNum);
 
