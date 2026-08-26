@@ -21,7 +21,15 @@ private:
 
 public:
 	explicit Disk(const long long& maxSize, std::string& dbName);
-	void setCache(Cache* c);	// 绑定缓存对象
+
+	/* ========== special operation 特殊操作 ========== */
+
+	inline bool containsVar(std::string varName) { return inDisk.contains(varName) && !delDisk.contains(varName); }
+
+	/* ========== operation function(操作函数) ========== */
+
+	// 绑定缓存对象
+	void setCache(Cache* c);	
 	// 删除某变量
 	int delData(const std::string& varName);
 	// 持久化某变量
@@ -34,6 +42,8 @@ public:
 	int selData(std::list<std::string>& varNameSet, std::list<std::any>& resSet);
 	// 刷盘
 	int flushDisk();
+	// 数据重写：缓存+inDisk 数据写入新文件，删旧文件，更新 inDisk，清空 delDisk
+	int reWrite();	
 
 };
 

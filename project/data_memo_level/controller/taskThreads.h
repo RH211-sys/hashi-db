@@ -9,6 +9,7 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 /*
@@ -173,6 +174,15 @@ public:
 	}
 };
 
+
+/*
+	任务类型：用于区分磁盘线程中的两类任务
+	DISK_TASK：磁盘 IO 任务（慢，毫秒级：文件读写），进磁盘任务队列
+	CACHE_TASK：缓存操作任务（快，微秒级：访问 cache_db），进缓存任务队列，优先调度
+*/
+const int DISK_TASK = 1;	// 磁盘任务
+const int CACHE_TASK = 2;	// 缓存任务
+
 /*
 	磁盘线程：单线程串行执行磁盘 IO 任务（持久化/刷盘/重写/删除）
 	缓存调用后异步操作：提交任务立即返回，调用者不等待
@@ -184,9 +194,13 @@ class DiskThread {
 	friend class WriteThread;
 private:
 	std::thread worker;								// 磁盘单线程
-	std::queue<std::function<void()>> tasks;		// 磁盘任务队列
+	std::queue<std::function<void()>> cacheTasks;	// 缓存操作任务队列（快：访问 cache_db，微秒级）
+	std::queue<std::function<void()>> diskTasks;	// 磁盘 IO 任务队列（慢：文件读写，毫秒级）
 	std::mutex mtx;									// 保护任务队列（push 线程与 worker 并发访问）
 	std::condition_variable cv;						// 条件变量，通知线程取任务
+	int taskGap = 0;			// 任务差距（处理缓存 - 处理磁盘）
+	int upEdge = 15;			// 差距上限：缓存任务堆积到上限时，若有磁盘任务则让位调度一个
+	int lowEdge = -5;			// 差距下限：磁盘任务处理过多时，重置差距
 	bool stop = false;								// 停止标志（析构时置位）
 
 	// 线程入口：取任务 -> 执行回调 -> 继续取，直到停止且队列清空
@@ -195,12 +209,30 @@ private:
 			std::function<void()> task;
 			{
 				std::unique_lock<std::mutex> lock(mtx);
-				cv.wait(lock, [this] { return stop || !tasks.empty(); });
-				if (stop && tasks.empty()) {
+				cv.wait(lock, [this] { return stop || !cacheTasks.empty() || !diskTasks.empty(); });
+				if (stop && cacheTasks.empty() && diskTasks.empty()) {
 					return;	// 停止且队列清空，本线程退出
 				}
-				task = std::move(tasks.front());
-				tasks.pop();
+				// 调度决策：缓存任务优先；差距到上限且有待处理磁盘任务时，让位给磁盘
+				if (!cacheTasks.empty() && !(taskGap >= upEdge && !diskTasks.empty())) {
+					task = std::move(cacheTasks.front());
+					cacheTasks.pop();
+					++taskGap;	// 处理缓存任务 +1
+					if (taskGap >= upEdge && diskTasks.empty()) {
+						taskGap = 0;	// 到达上限且无磁盘任务：重置差距，继续处理缓存
+					}
+				}
+				else if (!diskTasks.empty()) {
+					task = std::move(diskTasks.front());
+					diskTasks.pop();
+					--taskGap;	// 处理磁盘任务 -1
+					if (taskGap <= lowEdge) {
+						taskGap = 0;	// 到达下限：重置差距
+					}
+				}
+				else {
+					continue;	// 理论不可达：wait 已保证队列非空
+				}
 			}
 			try {
 				task();	// 锁外执行回调，磁盘 IO 全程锁外
@@ -230,29 +262,45 @@ public:
 	DiskThread(const DiskThread&) = delete;
 	DiskThread& operator=(const DiskThread&) = delete;
 
-	// 提交磁盘任务，立即返回，由磁盘线程串行执行
-	void push(std::function<void()> task) {
+	// 提交任务，立即返回，由磁盘线程串行执行
+	// taskType：任务类型（DISK_TASK 磁盘任务 / CACHE_TASK 缓存任务）
+	void push(std::function<void()> task, int taskType) {
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 			if (stop) {
 				return;	// 已停止，拒绝新任务
 			}
-			tasks.push(std::move(task));
+			if (taskType == DISK_TASK) {
+				diskTasks.push(std::move(task));
+			}
+			else if (taskType == CACHE_TASK) {
+				cacheTasks.push(std::move(task));	// 默认按缓存任务处理
+			}
 		}
 		cv.notify_one();
 	}
 
-	// 提交磁盘任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
+	// 提交任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
 	// 任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
-	std::future<int> submit(std::function<int()> task) {
-		auto ptask = std::make_shared<std::packaged_task<int()>>(std::move(task));
-		std::future<int> fut = ptask->get_future();
+	// taskType：任务类型（DISK_TASK 磁盘任务 / CACHE_TASK 缓存任务）
+	// 模板直接接收可调用对象（lambda 等），避免 std::function 模板推导失败
+	// std::invoke_result_t<F>：F 无参调用得到的返回类型
+	template <typename F>
+	std::future<std::invoke_result_t<F>> submit(F task, int taskType) {
+		using R = std::invoke_result_t<F>;	// 任务返回类型，由可调用对象自动推导
+		auto ptask = std::make_shared<std::packaged_task<R()>>(std::move(task));
+		std::future<R> fut = ptask->get_future();
 		{
 			std::lock_guard<std::mutex> lock(mtx);
 			if (stop) {
 				return {};	// 已停止，拒绝新任务
 			}
-			tasks.push([ptask]() { (*ptask)(); });	// 通过 shared_ptr 延长任务对象生命周期
+			if (taskType == DISK_TASK) {
+				diskTasks.push([ptask]() { (*ptask)(); });	// 通过 shared_ptr 延长任务对象生命周期
+			}
+			else if (taskType == CACHE_TASK) {
+				cacheTasks.push([ptask]() { (*ptask)(); });	// 默认按缓存任务处理
+			}
 		}
 		cv.notify_one();
 		return fut;

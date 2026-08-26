@@ -42,3 +42,7 @@ int Disk::flushDisk()
 {
     return 0;
 }
+
+int Disk::reWrite() {
+
+}
