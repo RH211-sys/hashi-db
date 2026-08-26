@@ -22,7 +22,7 @@ public:
 	template <typename T>
 	int addData(const std::string& varName, const T& entity) { return cache->addData(varName, entity); }
 
-	int delData(const std::string& varName);
+	int delData(const std::string& varName) { return cache->delData(varName); }
 
 	template <typename T>
 	int modData(const std::string& varName, const T& entity) { return cache->modData(varName, entity); }
@@ -30,7 +30,7 @@ public:
 	template <typename T>
 	int modData(const std::string& varName, const std::string& member, const T& entity) { return cache->modData(varName, member, entity); }
 
-	int selData(const std::string& varName, std::any& res);
+	int selData(const std::string& varName, std::any& res) { return selData(varName, res); }
 
 	// ---- 持久化 API ----
 	int persisVar(const std::string& varName);	// 提交任务,不阻塞

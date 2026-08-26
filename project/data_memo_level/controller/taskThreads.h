@@ -4,6 +4,8 @@
 
 #include <condition_variable>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -238,6 +240,22 @@ public:
 			tasks.push(std::move(task));
 		}
 		cv.notify_one();
+	}
+
+	// 提交磁盘任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
+	// 任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
+	std::future<int> submit(std::function<int()> task) {
+		auto ptask = std::make_shared<std::packaged_task<int()>>(std::move(task));
+		std::future<int> fut = ptask->get_future();
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			if (stop) {
+				return {};	// 已停止，拒绝新任务
+			}
+			tasks.push([ptask]() { (*ptask)(); });	// 通过 shared_ptr 延长任务对象生命周期
+		}
+		cv.notify_one();
+		return fut;
 	}
 };
 

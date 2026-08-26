@@ -29,7 +29,7 @@ public:
 	// 持久化某变量的所有数据
 	int persisData(std::list<std::string>& varNameSet);
 	// 查询某变量
-	int selData(std::string& varName, std::any& res);
+	int selData(const std::string& varName, std::any& res);
 	// 查询多个变量
 	int selData(std::list<std::string>& varNameSet, std::list<std::any>& resSet);
 	// 刷盘
