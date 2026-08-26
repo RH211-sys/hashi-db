@@ -2,6 +2,9 @@
 
 Disk::Disk(const long long& maxSize, std::string& dbName)
 {
+    this->curSize = 0;
+    this->dbName = dbName;
+    this->maxSize = maxSize;
 }
 
 void Disk::setCache(Cache* c)

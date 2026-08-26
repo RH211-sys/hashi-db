@@ -1,10 +1,11 @@
 #include "cache.h"
 
 
-Cache::Cache(long long memoSize)
+Cache::Cache(const long long memoSize, const int batchSize, const int upDisEdge, const int minDisEdge)
 {
 	this->memoSize = memoSize;
 	this->curSize = 0;
+	this->rwMutex = std::make_unique<WritePrefMutex>(batchSize, upDisEdge, minDisEdge);
 }
 
 void Cache::setDisk(Disk* d)

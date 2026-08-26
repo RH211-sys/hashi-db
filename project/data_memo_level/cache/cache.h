@@ -4,6 +4,7 @@
 
 #include "../data_type.h"
 #include "../disk/disk.h"
+#include "../common/writePrefMutex.h"
 #include <unordered_map>
 
 class Disk;
@@ -15,9 +16,11 @@ private:
 	long long memoSize;	// 缓存大小设定值
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
+	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
+
 
 public:
-	Cache(long long memoSize);
+	Cache(const long long memoSize, const int batchSize = 4, const int upDisEdge = 10, const int minDisEdge = -3);
 	void setDisk(Disk* d);	// 绑定磁盘对象
 
 	// 新增数据
