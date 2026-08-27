@@ -16,7 +16,7 @@ private:
 	long long maxSize;		// 磁盘最大容量
 	long long curSize;		// 磁盘当前容量
 	std::string dbName;		// 数据库名称(文件名)
-	std::unordered_map<std::string, int> inDisk;		// 变量名 + 偏移量
+	std::unordered_map<std::string, std::pair<int, int>> inDisk;		// 变量名 + 偏移量 (数据存储first + 时间存储second)
 	std::unordered_set<std::string> delDisk;			// 待删除的变量名
 
 public:
@@ -36,8 +36,10 @@ public:
 	int persisData(const std::string& varName);
 	// 持久化某变量的所有数据
 	int persisData(std::list<std::string>& varNameSet);
+	// 持久化所有数据
+	int persisAll();
 	// 查询某变量
-	int selData(const std::string& varName, std::any& res);
+	int selData(const std::string& varName, std::any& res, Val& val);
 	// 查询多个变量
 	int selData(std::list<std::string>& varNameSet, std::list<std::any>& resSet);
 	// 刷盘

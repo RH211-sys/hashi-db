@@ -83,8 +83,8 @@ public:
 		rwMutex->lock();
 		auto it = cache_db.find(varName);
 		if (it != cache_db.end()) {
-			it->second.entity = entity;	// 命中：替换值实体
-			it->second.isDirty = true;	// 标记为脏，等待刷盘
+			it->second.entity = entity;	// 命中：替换实体值
+			it->second.isDirty = true;	// 标记为脏数据，等待刷盘
 			rwMutex->unlock();
 			resCode = SUCCESS;
 			return;

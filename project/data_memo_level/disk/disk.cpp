@@ -28,7 +28,12 @@ int Disk::persisData(std::list<std::string>& varNameSet)
     return 0;
 }
 
-int Disk::selData(const std::string& varName, std::any& res)
+int Disk::persisAll()
+{
+    return 0;
+}
+
+int Disk::selData(const std::string& varName, std::any& res, Val& val)
 {
     return 0;
 }

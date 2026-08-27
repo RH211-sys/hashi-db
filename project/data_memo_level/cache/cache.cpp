@@ -32,8 +32,10 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 	rwMutex->unlock_shared();
 
 	// 提交磁盘读任务，只有发起者 get() 阻塞等待结果，其他线程不受影响
-	std::future<int> fut = diskThread->submit([this, &varName, &res]() {
-		return disk->selData(varName, res);
+	// disk 侧找到变量时填好 res（实体）和 val（时间信息：创建时间/是否永久/过期时间）
+	Val val;
+	std::future<int> fut = diskThread->submit([this, &varName, &res, &val]() {
+		return disk->selData(varName, res, val);
 	}, DISK_TASK);	// 读文件，磁盘 IO 任务
 	int code = fut.get();
 	if (code != SUCCESS) {
@@ -42,16 +44,13 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 	}
 
 	// 回填缓存前重新校验 key（可能已被并发修改/删除），校验通过才回填
+	// disk 已填时间信息，缓存只补 isDirty 和 entity
 	{
 		rwMutex->lock();	// 回填是写操作，拿写锁
 		if (!cache_db.contains(varName)) {
-			Val v;
-			v.entity = res;
-			v.isDirty = false;	// 磁盘数据是干净的
-			// 先这么写着，用永不过期先占位
-			v.isPermanent = true; 
-			v.isDirty = false;
-			cache_db.emplace(varName, std::move(v));	// 移动语义，避免拷贝
+			val.isDirty = false;	// 磁盘数据是干净的
+			val.entity = res;		// 实体从磁盘读回
+			cache_db.emplace(varName, std::move(val));	// 移动语义，避免拷贝
 		}
 		rwMutex->unlock();
 	}
@@ -97,10 +96,9 @@ std::future<int> Cache::persisVar(const std::string& varName)
 
 std::future<int> Cache::persisVar()
 {
-	// 暂时不实现组传递式持久化：返回已就绪的 future，get() 立即得到 UNKNOWN_ERROR
-	std::promise<int> p;
-	p.set_value(UNKNOWN_ERROR);
-	return p.get_future();
+	// 持久化缓存中所有脏数据：磁盘线程执行 persisAll（内部遍历 cache_db 收集脏数据并写文件）
+	// 提交即返回，结果走 future
+	return diskThread->submit([this]() { return disk->persisAll(); }, DISK_TASK);
 }
 
 std::future<int> Cache::reWrite()
