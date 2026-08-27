@@ -12,7 +12,7 @@ class Cache;
 class Disk {
 	friend class Cache;
 private:
-	Cache* cache = nullptr;	// 缓存对象指针（由上层绑定）
+	std::weak_ptr<Cache> cache;	// 缓存对象指针，用weak防止内存泄露
 	long long maxSize;		// 磁盘最大容量
 	long long curSize;		// 磁盘当前容量
 	std::string dbName;		// 数据库名称(文件名)
@@ -29,7 +29,7 @@ public:
 	/* ========== operation function(操作函数) ========== */
 
 	// 绑定缓存对象
-	void setCache(Cache* c);	
+	void setCache(std::shared_ptr<Cache> c);
 	// 删除某变量
 	int delData(const std::string& varName);
 	// 持久化某变量

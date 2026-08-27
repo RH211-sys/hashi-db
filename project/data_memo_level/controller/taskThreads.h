@@ -279,12 +279,13 @@ public:
 		}
 		cv.notify_one();
 	}
-
-	// 提交任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
-	// 任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
-	// taskType：任务类型（DISK_TASK 磁盘任务 / CACHE_TASK 缓存任务）
-	// 模板直接接收可调用对象（lambda 等），避免 std::function 模板推导失败
-	// std::invoke_result_t<F>：F 无参调用得到的返回类型
+	/*
+		提交任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
+		任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
+		taskType：任务类型（DISK_TASK 磁盘任务 / CACHE_TASK 缓存任务）
+		模板直接接收可调用对象（lambda 等），避免 std::function 模板推导失败
+		std::invoke_result_t<F>：F 无参调用得到的返回类型
+	*/
 	template <typename F>
 	std::future<std::invoke_result_t<F>> submit(F task, int taskType) {
 		using R = std::invoke_result_t<F>;	// 任务返回类型，由可调用对象自动推导

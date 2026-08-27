@@ -7,14 +7,21 @@ Disk::Disk(const long long& maxSize, std::string& dbName)
     this->maxSize = maxSize;
 }
 
-void Disk::setCache(Cache* c)
+void Disk::setCache(std::shared_ptr<Cache> c)
 {
+    cache = c;
 }
 
 
 int Disk::delData(const std::string& varName)
 {
-    return 0;
+    // 数据仍在文件里（inDisk 保留偏移），只标记逻辑删除，重写时跳过清理
+    if (inDisk.contains(varName) && !delDisk.contains(varName)) {
+        delDisk.emplace(varName);
+        return SUCCESS;
+    }
+    // 磁盘没有该数据（或已删除）
+    return FIND_FAILED;
 }
 
 
