@@ -33,7 +33,7 @@ public:
 	int delData(const std::string& varName);
 	// 持久化某变量
 	int persisData(const std::string& varName);
-	// 持久化某变量的所有数据
+	// 持久化某变量集
 	int persisData(std::list<std::string>& varNameSet);
 	// 持久化所有数据
 	int persisAll();

@@ -38,6 +38,7 @@ add_executable(myDB ${MYDB_SOURCES} "project/data_memo_level/cache/cache.cpp" "p
 # 例如 #include "data_memo_level/memory/memo.h"
 target_include_directories(myDB PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/project"
+    "${CMAKE_CURRENT_SOURCE_DIR}/project/third_party_lib/cereal_lib/include"
 )
 
 # ============ 可选：链接第三方库 ============
