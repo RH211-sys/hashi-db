@@ -28,6 +28,7 @@ file(GLOB_RECURSE MYDB_SOURCES
     CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/project/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/project/third_party"
 )
 
 # ============ 生成可执行文件 ============

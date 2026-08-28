@@ -16,15 +16,14 @@ private:
 	long long maxSize;		// 磁盘最大容量
 	long long curSize;		// 磁盘当前容量
 	std::string dbName;		// 数据库名称(文件名)
-	std::unordered_map<std::string, std::pair<int, int>> inDisk;		// 变量名 + 偏移量 (数据存储first + 时间存储second)
-	std::unordered_set<std::string> delDisk;			// 待删除的变量名
+	std::unordered_map<std::string, int> inDisk;		// 变量名 + 偏移量
 
 public:
 	explicit Disk(const long long& maxSize, std::string& dbName);
 
 	/* ========== special operation 特殊操作 ========== */
 
-	inline bool containsVar(std::string varName) { return inDisk.contains(varName) && !delDisk.contains(varName); }
+	inline bool containsVar(std::string varName) { return inDisk.contains(varName); }
 
 	/* ========== operation function(操作函数) ========== */
 

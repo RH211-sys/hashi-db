@@ -1,10 +1,12 @@
 #include "disk.h"
 
+
 Disk::Disk(const long long& maxSize, std::string& dbName)
 {
     this->curSize = 0;
     this->dbName = dbName;
     this->maxSize = maxSize;
+
 }
 
 void Disk::setCache(std::shared_ptr<Cache> c)
@@ -16,17 +18,18 @@ void Disk::setCache(std::shared_ptr<Cache> c)
 int Disk::delData(const std::string& varName)
 {
     // 数据仍在文件里（inDisk 保留偏移），只标记逻辑删除，重写时跳过清理
-    if (inDisk.contains(varName) && !delDisk.contains(varName)) {
-        delDisk.emplace(varName);
+    if (inDisk.contains(varName)) {
+        inDisk.erase(varName);
         return SUCCESS;
     }
-    // 磁盘没有该数据（或已删除）
+    // 该数据不存在，可能已经被删除了
     return FIND_FAILED;
 }
 
 
 int Disk::persisData(const std::string& varName)
 {
+
     return 0;
 }
 
