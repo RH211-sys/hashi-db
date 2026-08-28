@@ -54,22 +54,29 @@ int Disk::persisData(const std::string& varName)
     /* ========== 检查基本信息是否正确 =========== */
 
     // 变量名超长：定长字段放不下，无法写入
-    if (varName.size() > NAME_LEN) return LONG_VAR_NAME;
+    if (varName.size() > NAME_LEN) return LONG_NAME;
 
     // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
     auto reg = typeReg.find(val.typeName);
     if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
 
+    // 类型名超长：定长字段放不下，截断后无法反序列化
+    if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
+
     /* ========== 序列化 =========== */
 
     std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
     int dataSize = (int)bytes.size();			// 数据大小：只含实体
-    int recLen = 22 + NAME_LEN + dataSize;		// 记录总长：校验码1 + 大小4 + 时间17 + 变量名定长 + 实体
+    int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
     // 时间信息：微秒整数（8B），与 std::chrono 互转
     long long createUS = std::chrono::duration_cast<std::chrono::microseconds>(val.createTime.time_since_epoch()).count();
-    long long expireUS = val.isPermanent ? 0
-        : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
+    long long expireUS = 
+        val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
+
+    // 类型名补 '\0' 到定长
+    char typeBuf[TYPE_LEN] = { 0 };
+    memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
 
     // 变量名补 '\0' 到定长
     char nameBuf[NAME_LEN] = { 0 };
@@ -102,16 +109,17 @@ int Disk::persisData(const std::string& varName)
     // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
     file.seekp(offset);
     char broken = CHECK_BROKEN;
-    file.write(&broken, 1);
-    file.write((char*)&dataSize, 4);
-    file.write((char*)&createUS, 8);
-    file.write((char*)&expireUS, 8);
-    file.write((char*)&val.isPermanent, 1);
+    file.write(&broken, CODE_LEN);
+    file.write((char*)&dataSize, ENTITY_SIZE_LEN);
+    file.write((char*)&createUS, CREATE_TIME_LEN);
+    file.write((char*)&expireUS, EXPIRE_TIME_LEN);
+    file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
+    file.write(typeBuf, TYPE_LEN);
     file.write(nameBuf, NAME_LEN);
     file.write(bytes.data(), dataSize);
     file.seekp(offset);		// 回写有效校验码
     char valid = CHECK_VALID;
-    file.write(&valid, 1);
+    file.write(&valid, CODE_LEN);
     file.flush();
     if (!file) {
         // 写失败：isDirty 置回 true，等待下次重刷
@@ -171,20 +179,26 @@ int Disk::persisData(std::list<std::string>& varNameSet)
 
         /* ========== 检查基本信息是否正确 =========== */
         // 变量名超长：定长字段放不下，无法写入
-        if (varName.size() > NAME_LEN) return LONG_VAR_NAME;
+        if (varName.size() > NAME_LEN) return LONG_NAME;
         // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
         auto reg = typeReg.find(val.typeName);
         if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+        // 类型名超长：定长字段放不下，截断后无法反序列化
+        if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
         /* ========== 序列化 =========== */
         std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
         int dataSize = (int)bytes.size();			// 数据大小：只含实体
-        int recLen = 22 + NAME_LEN + dataSize;		// 记录总长：校验码1 + 大小4 + 时间17 + 变量名定长 + 实体
+        int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
         // 时间信息：微秒整数（8B），与 std::chrono 互转
         long long createUS = std::chrono::duration_cast<std::chrono::microseconds>(val.createTime.time_since_epoch()).count();
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
+
+        // 类型名补 '\0' 到定长
+        char typeBuf[TYPE_LEN] = { 0 };
+        memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
 
         // 变量名补 '\0' 到定长
         char nameBuf[NAME_LEN] = { 0 };
@@ -210,16 +224,17 @@ int Disk::persisData(std::list<std::string>& varNameSet)
         // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
         file.seekp(offset);
         char broken = CHECK_BROKEN;
-        file.write(&broken, 1);
-        file.write((char*)&dataSize, 4);
-        file.write((char*)&createUS, 8);
-        file.write((char*)&expireUS, 8);
-        file.write((char*)&val.isPermanent, 1);
+        file.write(&broken, CODE_LEN);
+        file.write((char*)&dataSize, ENTITY_SIZE_LEN);
+        file.write((char*)&createUS, CREATE_TIME_LEN);
+        file.write((char*)&expireUS, EXPIRE_TIME_LEN);
+        file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
+        file.write(typeBuf, TYPE_LEN);
         file.write(nameBuf, NAME_LEN);
         file.write(bytes.data(), dataSize);
         file.seekp(offset);		// 回写有效校验码
         char valid = CHECK_VALID;
-        file.write(&valid, 1);
+        file.write(&valid, CODE_LEN);
 
         /* ========== 更新disk的大小记录 =========== */
         // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
@@ -280,7 +295,57 @@ int Disk::persisAll()
 
 int Disk::selData(const std::string& varName, std::any& res, Val& val)
 {
-    return 0;
+    /* ========== 查内存索引 =========== */
+    auto it = inDisk.find(varName);
+    if (it == inDisk.end()) return FIND_FAILED;	// 磁盘没有该数据
+    int offset = it->second;
+
+    /* ========== 打开文件读取 =========== */
+    std::ifstream file(dbName, std::ios::binary);
+    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
+
+    /* ========== 读记录头 =========== */
+    file.seekg(offset);
+    char check = 0;
+    file.read(&check, CODE_LEN);
+    if (!file || check != CHECK_VALID) return FIND_FAILED;	// 校验码无效：数据不完整
+
+    int dataSize = 0;
+    file.read((char*)&dataSize, ENTITY_SIZE_LEN);
+
+    // 时间信息：微秒整数（8B），与 std::chrono 互转
+    long long createUS = 0, expireUS = 0;
+    char isPermanent = 0;
+    file.read((char*)&createUS, CREATE_TIME_LEN);
+    file.read((char*)&expireUS, EXPIRE_TIME_LEN);
+    file.read(&isPermanent, IS_PERMANENT_LEN);
+
+    char typeBuf[TYPE_LEN] = { 0 };
+    file.read(typeBuf, TYPE_LEN);
+    char nameBuf[NAME_LEN] = { 0 };
+    file.read(nameBuf, NAME_LEN);
+
+    // 记录里的变量名应与查询名一致（防偏移错乱）
+    if (memcmp(nameBuf, varName.c_str(), varName.size()) != 0) return FIND_FAILED;
+
+    /* ========== 读实体并反序列化 =========== */
+    std::vector<char> bytes(dataSize);
+    file.read(bytes.data(), dataSize);
+    if (!file) return FIND_FAILED;	// 读取失败（数据不完整）
+
+    // 查类型注册表，反序列化实体（any 类型擦除，按 typeName 查表拿模板实例）
+    std::string typeName(typeBuf);	// 截到 '\0'
+    auto reg = typeReg.find(typeName);
+    if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+    res = reg->second.second(bytes);	// 反序列化 → any
+
+    /* ========== 填时间信息 =========== */
+    val.typeName = typeName;
+    val.createTime = std::chrono::system_clock::time_point(std::chrono::microseconds(createUS));
+    val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
+    val.expireTime = val.isPermanent ? val.createTime
+        : std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
+    return SUCCESS;
 }
 
 int Disk::selData(std::list<std::string>& varNameSet, std::list<std::any>& resSet)
@@ -294,5 +359,5 @@ int Disk::flushDisk()
 }
 
 int Disk::reWrite() {
-
+    return 0;
 }
