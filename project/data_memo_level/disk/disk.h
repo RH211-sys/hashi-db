@@ -34,13 +34,13 @@ public:
 	// 持久化某变量
 	int persisData(const std::string& varName);
 	// 持久化某变量集
-	int persisData(std::list<std::string>& varNameSet);
+	int persisData(std::vector<std::string>& varNameSet);
 	// 持久化所有数据
 	int persisAll();
 	// 查询某变量
 	int selData(const std::string& varName, std::any& res, Val& val);
 	// 查询多个变量
-	int selData(std::list<std::string>& varNameSet, std::list<std::any>& resSet);
+	int selData(std::vector<std::string>& varNameSet, std::vector<std::any>& resSet, std::vector<Val>& vals);
 	// 刷盘
 	int flushDisk();
 	// 数据重写：缓存+inDisk 数据写入新文件，删旧文件，更新 inDisk，清空 delDisk

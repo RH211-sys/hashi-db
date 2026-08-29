@@ -88,7 +88,8 @@ std::future<int> Cache::persisVar(const std::string& varName)
 	// 未找到该变量，无法进行持久化
 	if (!varExist) return FIND_FAILED;
 	*/
-	// 由于考虑到磁盘异步处理的时候，cache_db可能因为并发把数据删了，所以直接给磁盘线程检查，缓存模块不检查
+
+	// 由于考虑到磁盘异步处理的时候，cache_db可能因为并发把数据删了，所以直接给磁盘线程检查，缓存模块不检查，防止磁盘访问不到该数据后崩溃
 
 	// 找到该数据，进行持久化（写文件，磁盘 IO 任务），提交即返回，结果走 future
 	return diskThread->submit([this, varName]() { return disk->persisData(varName); }, DISK_TASK);
