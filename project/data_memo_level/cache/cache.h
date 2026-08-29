@@ -29,7 +29,7 @@ public:
 	void setDiskThread(std::shared_ptr<DiskThread> t);	// 绑定磁盘线程对象
 
 	/*  功能：新增数据，
-		参数：变量名，值实体，是否永久，数据持续时间（过期时间 = 创建时间 + 持续时间）
+		参数：变量名，值实体，是否永久，数据持续时间（过期时间 = 更新时间 + 持续时间）
 		resCode：操作码（eg：200，表示操作成功）
 	*/
 	template <typename T>
@@ -38,9 +38,9 @@ public:
 		Val v;
 		v.typeName = T::getClassName();	// 类型名称
 		v.isPermanent = isPermanent;	// 是否永不过期
-		v.createTime = std::chrono::system_clock::now();
+		v.updateTime = std::chrono::system_clock::now();
 		if (!isPermanent) {
-			v.expireTime = v.createTime + during;	// 非永久：过期时间 = 创建时间 + 持续时间
+			v.expireTime = v.updateTime + during;	// 非永久：过期时间 = 更新时间 + 持续时间
 		}
 		v.isDirty = true;				// 新数据标记为脏，等待刷盘
 		v.entity = entity;
@@ -84,6 +84,7 @@ public:
 		auto it = cache_db.find(varName);
 		if (it != cache_db.end()) {
 			it->second.entity = entity;	// 命中：替换实体值
+			it->second.updateTime = std::chrono::system_clock::now();	// 更新时间
 			it->second.isDirty = true;	// 标记为脏数据，等待刷盘
 			rwMutex->unlock();
 			resCode = SUCCESS;
@@ -104,7 +105,7 @@ public:
 		Val v;
 		v.typeName = T::getClassName();
 		v.isPermanent = true;	// 磁盘数据不存过期信息，默认永久
-		v.createTime = std::chrono::system_clock::now();
+		v.updateTime = std::chrono::system_clock::now();
 		v.isDirty = true;		// 脏数据，等待刷盘更新磁盘
 		v.entity = entity;
 		rwMutex->lock();

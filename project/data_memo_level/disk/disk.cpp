@@ -77,7 +77,7 @@ int Disk::persisData(const std::string& varName)
     int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
     // 时间信息：微秒整数（8B），与 std::chrono 互转
-    long long createUS = std::chrono::duration_cast<std::chrono::microseconds>(val.createTime.time_since_epoch()).count();
+    long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
     long long expireUS = 
         val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -118,7 +118,7 @@ int Disk::persisData(const std::string& varName)
     char broken = CHECK_BROKEN;
     file.write(&broken, CODE_LEN);
     file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-    file.write((char*)&createUS, CREATE_TIME_LEN);
+    file.write((char*)&updateUS, UPDATE_TIME_LEN);
     file.write((char*)&expireUS, EXPIRE_TIME_LEN);
     file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
     file.write(typeBuf, TYPE_LEN);
@@ -199,7 +199,7 @@ int Disk::persisData(std::vector<std::string>& varNameSet)
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
         // 时间信息：微秒整数（8B），与 std::chrono 互转
-        long long createUS = std::chrono::duration_cast<std::chrono::microseconds>(val.createTime.time_since_epoch()).count();
+        long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -233,7 +233,7 @@ int Disk::persisData(std::vector<std::string>& varNameSet)
         char broken = CHECK_BROKEN;
         file.write(&broken, CODE_LEN);
         file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-        file.write((char*)&createUS, CREATE_TIME_LEN);
+        file.write((char*)&updateUS, UPDATE_TIME_LEN);
         file.write((char*)&expireUS, EXPIRE_TIME_LEN);
         file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
         file.write(typeBuf, TYPE_LEN);
@@ -321,9 +321,9 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     file.read((char*)&dataSize, ENTITY_SIZE_LEN);
 
     // 时间信息：微秒整数（8B），与 std::chrono 互转
-    long long createUS = 0, expireUS = 0;
+    long long updateUS = 0, expireUS = 0;
     char isPermanent = 0;
-    file.read((char*)&createUS, CREATE_TIME_LEN);
+    file.read((char*)&updateUS, UPDATE_TIME_LEN);
     file.read((char*)&expireUS, EXPIRE_TIME_LEN);
     file.read(&isPermanent, IS_PERMANENT_LEN);
 
@@ -348,9 +348,9 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
 
     /* ========== 填时间信息 =========== */
     val.typeName = typeName;
-    val.createTime = std::chrono::system_clock::time_point(std::chrono::microseconds(createUS));
+    val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
     val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
-    val.expireTime = val.isPermanent ? val.createTime
+    val.expireTime = val.isPermanent ? val.updateTime
         : std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
     return SUCCESS;
 }
@@ -379,11 +379,11 @@ int Disk::selData(std::vector<std::string>& varNameSet, std::vector<std::any>& r
 		file.read((char*)&dataSize, ENTITY_SIZE_LEN);
 
 		// 时间信息：微秒整数（8B），与 std::chrono 互转
-		long long createUS = 0, expireUS = 0;
+		long long updateUS = 0, expireUS = 0;
 		char isPermanent = 0;
         char typeBuf[TYPE_LEN] = { 0 };
         char nameBuf[NAME_LEN] = { 0 };
-		file.read((char*)&createUS, CREATE_TIME_LEN);
+		file.read((char*)&updateUS, UPDATE_TIME_LEN);
 		file.read((char*)&expireUS, EXPIRE_TIME_LEN);
 		file.read(&isPermanent, IS_PERMANENT_LEN);
 		file.read(typeBuf, TYPE_LEN);
@@ -406,12 +406,12 @@ int Disk::selData(std::vector<std::string>& varNameSet, std::vector<std::any>& r
 		/* ========== 收集结果 =========== */
 		resSet.emplace_back(reg->second.second(bytes));	// 实体：反序列化 → any
 
-		// 时间信息：与单变量版一致（永久数据的过期时间 = 创建时间，不使用）
+		// 时间信息：与单变量版一致（永久数据的过期时间 = 更新时间，不使用）
 		Val val;
 		val.typeName = typeName;
-		val.createTime = std::chrono::system_clock::time_point(std::chrono::microseconds(createUS));
+		val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
 		val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
-		val.expireTime = val.isPermanent ? val.createTime
+		val.expireTime = val.isPermanent ? val.updateTime
 			: std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
 		vals.emplace_back(std::move(val));
 		return SUCCESS;
@@ -471,6 +471,23 @@ int Disk::reWrite()
     auto c = cache.lock();
     if (!c) return UNKNOWN_ERROR;	// 缓存未绑定或已析构
 
+    // 重写 = 整理所有数据：先删掉过期缓存数据（缓存删 + 磁盘索引删，重写时跳过，不留文件防复活）
+    {
+        c->rwMutex->lock();	// 有删除操作，需要写锁
+        auto now = std::chrono::system_clock::now();
+        auto it = c->cache_db.begin();
+        while (it != c->cache_db.end()) {
+            auto& val = it->second;
+            if (!val.isPermanent && val.expireTime <= now) {
+                inDisk.erase(it->first);	// 磁盘索引删：重写主循环不再搬移它
+                it = c->cache_db.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        c->rwMutex->unlock();
+    }
+
     // 确保文件存在（in|out 模式打不开不存在的文件）
     std::ofstream touch(dbName, std::ios::binary | std::ios::app);
     touch.close();
@@ -508,7 +525,7 @@ int Disk::reWrite()
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;
 
         // 时间信息：微秒整数（8B），与 std::chrono 互转
-        long long createUS = std::chrono::duration_cast<std::chrono::microseconds>(val.createTime.time_since_epoch()).count();
+        long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -532,7 +549,7 @@ int Disk::reWrite()
         char valid = CHECK_VALID;
         file.write(&valid, CODE_LEN);
         file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-        file.write((char*)&createUS, CREATE_TIME_LEN);
+        file.write((char*)&updateUS, UPDATE_TIME_LEN);
         file.write((char*)&expireUS, EXPIRE_TIME_LEN);
         file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
         file.write(typeBuf, TYPE_LEN);

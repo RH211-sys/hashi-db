@@ -68,7 +68,7 @@ struct Val {
 	std::string typeName;								// 类型名称
 	bool isPermanent;									// 是否永不过期
 	std::chrono::system_clock::time_point expireTime;	// 过期时间
-	std::chrono::system_clock::time_point createTime;	// 创建时间
+	std::chrono::system_clock::time_point updateTime;	// 更新时间
 	bool isDirty;										// 脏数据标记（true为脏，false为非脏）
 	std::any entity;									// 值实体
 };

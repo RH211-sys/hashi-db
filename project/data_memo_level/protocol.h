@@ -23,7 +23,7 @@ const int TYPE_LEN = 32;			// 类型名定长上限（写不满补 '\0'）
 const int CODE_LEN = 1;				// 校验码长度
 const int ENTITY_SIZE_LEN = 4;		// 实体数据大小长度
 const int TIME_INFO_LEN = 17;		// 时间信息总长度
-const int CREATE_TIME_LEN = 8;		// 创建时间长度
+const int UPDATE_TIME_LEN = 8;		// 更新时间长度
 const int EXPIRE_TIME_LEN = 8;		// 过期时间长度
 const int IS_PERMANENT_LEN = 1;		// 是否永久长度
 

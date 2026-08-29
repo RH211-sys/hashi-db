@@ -32,7 +32,7 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 	rwMutex->unlock_shared();
 
 	// 提交磁盘读任务，只有发起者 get() 阻塞等待结果，其他线程不受影响
-	// disk 侧找到变量时填好 res（实体）和 val（时间信息：创建时间/是否永久/过期时间）
+	// disk 侧找到变量时填好 res（实体）和 val（时间信息：更新时间/是否永久/过期时间）
 	Val val;
 	std::future<int> fut = diskThread->submit([this, &varName, &res, &val]() {
 		return disk->selData(varName, res, val);
