@@ -8,7 +8,16 @@
 #include "../controller/taskThreads.h"
 #include <memory>
 #include <unordered_map>
+#include <cmath>	// 用于计算ln
 
+struct ListNode {
+	int key;
+	int val;
+	ListNode* pre;
+	ListNode* next;
+	ListNode() : key(0), val(0), pre(nullptr), next(nullptr) {}
+	ListNode(int _key, int _value) : key(_key), val(_value), pre(nullptr), next(nullptr) {};
+};
 class Disk;
 
 class Cache {
@@ -20,13 +29,20 @@ private:
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
 	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
-
-
+	std::unordered_map<int, ListNode*> LRU_hash;		// LRU算法中动态维护的链表
+	ListNode* start;
+	ListNode* end;
+private:
+	double LRU_score(Val& val);
 
 public:
 	Cache(const long long memoSize, const int batchSize = 4, const int upDisEdge = 10, const int minDisEdge = -3);
-	void setDisk(std::shared_ptr<Disk> d);	// 绑定磁盘对象
-	void setDiskThread(std::shared_ptr<DiskThread> t);	// 绑定磁盘线程对象
+
+	// 绑定磁盘对象
+	void setDisk(std::shared_ptr<Disk> d);	
+
+	// 绑定磁盘线程对象
+	void setDiskThread(std::shared_ptr<DiskThread> t);	
 
 	/*  功能：新增数据，
 		参数：变量名，值实体，是否永久，数据持续时间（过期时间 = 更新时间 + 持续时间）
@@ -115,6 +131,7 @@ public:
 		rwMutex->unlock();
 		resCode = SUCCESS;
 	}
+
 	// 用于修改某个变量的某个属性
 	template <typename T>
 	void modData(const std::string& varName, std::string& member, const T& entity, int& resCode);
@@ -124,15 +141,12 @@ public:
 
 	// 单个变量持久化：提交即返回，不阻塞，结果走 future
 	std::future<int> persisVar(const std::string& varName);
+
 	// 缓存全部持久化：提交即返回，不阻塞，结果走 future
 	std::future<int> persisVar();
 
-
 	// 数据重写：将缓存和inDisk中的所有数据写入到另一个文件中，并删除旧文件
 	std::future<int> reWrite();
-
-
-
 };
 
 #endif // !_CACHE_H_

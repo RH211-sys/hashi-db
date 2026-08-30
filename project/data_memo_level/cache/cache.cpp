@@ -8,6 +8,19 @@ Cache::Cache(const long long memoSize, const int batchSize, const int upDisEdge,
 	this->rwMutex = std::make_unique<WritePrefMutex>(batchSize, upDisEdge, minDisEdge);
 }
 
+
+/* =============== private =============== */
+
+double Cache::LRU_score(Val& val) {
+	auto now = std::chrono::system_clock::now();
+
+	
+
+	return 1;
+}
+
+/* =============== public =============== */
+
 void Cache::setDisk(std::shared_ptr<Disk> d)
 {
 	this->disk = d;
