@@ -8,6 +8,7 @@ const int SUCCESS = 200;		// 操作成功
 const int KEY_EXIST = 201;		// 变量已存在
 const int FIND_FAILED = 202;	// 未找到该变量
 const int TYPE_VALID = 203;		// 未注册该类型
+const int EXPIRED = 204;		// 数据已过期
 const int MEMO_OUT = 300;		// 内存爆满
 const int LONG_NAME = 301;		// 名称过长
 const int UNKNOWN_ERROR = 400;	// 未知错误

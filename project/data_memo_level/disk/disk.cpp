@@ -35,6 +35,14 @@ int Disk::delData(const std::string& varName)
     return FIND_FAILED;
 }
 
+int Disk::delData(std::vector<std::string> varNameSet)
+{
+    for (const auto& varName : varNameSet) {
+        inDisk.erase(varName);	// 不存在则无操作，不视为错误
+    }
+    return SUCCESS;
+}
+
 
 int Disk::persisData(const std::string& varName)
 {
@@ -139,6 +147,81 @@ int Disk::persisData(const std::string& varName)
             c->rwMutex->unlock();
         }
         return UNKNOWN_ERROR;	// 写入失败
+    }
+
+    /* ========== 更新disk的大小记录 =========== */
+
+    // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
+    inDisk[varName] = offset;
+    curSize += recLen;	// 只增不减：空洞/已删数据不回收，重写时重新统计
+    return SUCCESS;
+}
+
+int Disk::persisData(const std::string& varName, const Val& val)
+{
+    // 与无数据版流程一致，但数据由调用方提供：不查缓存、不动 isDirty（淘汰时缓存已删）
+
+    /* ========== 检查基本信息是否正确 =========== */
+
+    // 变量名超长：定长字段放不下，无法写入
+    if (varName.size() > NAME_LEN) return LONG_NAME;
+
+    // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
+    auto reg = typeReg.find(val.typeName);
+    if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+
+    // 类型名超长：定长字段放不下，截断后无法反序列化
+    if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
+
+    /* ========== 序列化 =========== */
+
+    std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
+    int dataSize = (int)bytes.size();			// 数据大小：只含实体
+    int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
+
+    // 时间信息：微秒整数（8B），与 std::chrono 互转
+    long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+    long long expireUS =
+        val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
+
+    // 类型名补 '\0' 到定长
+    char typeBuf[TYPE_LEN] = { 0 };
+    memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
+
+    // 变量名补 '\0' 到定长
+    char nameBuf[NAME_LEN] = { 0 };
+    memcpy(nameBuf, varName.c_str(), varName.size());
+
+    /* ========== 打开文件并进行写入 =========== */
+
+    // 确保文件存在（in|out 模式打不开不存在的文件，首次写先创建）
+    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
+    touch.close();
+
+    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
+    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
+
+    // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
+    file.seekp(0, std::ios::end);
+    int offset = (int)file.tellp();	// 记录偏移 = 文件当前大小
+
+    // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
+    file.seekp(offset);
+    char broken = CHECK_BROKEN;
+    file.write(&broken, CODE_LEN);
+    file.write((char*)&dataSize, ENTITY_SIZE_LEN);
+    file.write((char*)&updateUS, UPDATE_TIME_LEN);
+    file.write((char*)&expireUS, EXPIRE_TIME_LEN);
+    file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
+    file.write(typeBuf, TYPE_LEN);
+    file.write(nameBuf, NAME_LEN);
+    file.write(bytes.data(), dataSize);
+    file.seekp(offset);		// 回写有效校验码
+    char valid = CHECK_VALID;
+    file.write(&valid, CODE_LEN);
+    file.flush();
+    if (!file) {
+        return UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试，调用方自行处理）
     }
 
     /* ========== 更新disk的大小记录 =========== */
@@ -348,6 +431,7 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
 
     /* ========== 填时间信息 =========== */
     val.typeName = typeName;
+    val.dataSize = dataSize;	// 数据大小：实体字节数（回填缓存用）
     val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
     val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
     val.expireTime = val.isPermanent ? val.updateTime
@@ -409,6 +493,7 @@ int Disk::selData(std::vector<std::string>& varNameSet, std::vector<std::any>& r
 		// 时间信息：与单变量版一致（永久数据的过期时间 = 更新时间，不使用）
 		Val val;
 		val.typeName = typeName;
+		val.dataSize = dataSize;	// 数据大小：实体字节数（回填缓存用）
 		val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
 		val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
 		val.expireTime = val.isPermanent ? val.updateTime

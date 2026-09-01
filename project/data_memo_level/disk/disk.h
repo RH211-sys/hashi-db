@@ -31,10 +31,16 @@ public:
 	void setCache(std::shared_ptr<Cache> c);
 	// 删除某变量
 	int delData(const std::string& varName);
+	// 批量删除变量（集合版，一次提交）
+	int delData(std::vector<std::string> varNameSet);
 	// 持久化某变量
 	int persisData(const std::string& varName);
+	// 持久化某变量（带数据版：数据由调用方提供，不查缓存，供淘汰刷盘用）
+	int persisData(const std::string& varName, const Val& val);
 	// 持久化某变量集
 	int persisData(std::vector<std::string>& varNameSet);
+	// 持久化某个数据
+	
 	// 持久化所有数据
 	int persisAll();
 	// 查询某变量

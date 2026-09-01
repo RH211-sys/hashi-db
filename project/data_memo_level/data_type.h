@@ -2,14 +2,6 @@
 #ifndef _DATA_TYPE_H_
 #define _DATA_TYPE_H_
 
-
-/*
-	该文件通过#include用户自定义的数据类型，只需include
-	用户需要专门创建一个文件A，定义自定义类，然后在该文件中include文件A
-	自定义类，必要的方法：
-	1. 获取数据类型的类名(getClassName)之类的函数
-	2. 序列化成员模板 serialize(Archive&)，cereal 按字段自动打包/拆包
-*/
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
@@ -18,8 +10,17 @@
 #include <any>
 #include <chrono>
 #include <sstream>
-#include "protocol.h"
 #include <memory>
+#include "protocol.h"
+
+/*
+	该文件通过#include用户自定义的数据类型，只需include
+	用户需要专门创建一个文件A，定义自定义类，然后在该文件中include文件A
+	自定义类，必要的方法：
+	1. 获取数据类型的类名(getClassName)之类的函数
+	2. 序列化成员模板 serialize(Archive&)，cereal 按字段自动打包/拆包
+	3. 用户在服务器需要定义好计算对象大小的成员函数，以提高处理速度，函数名是theSize
+*/
 
 inline std::unordered_set<std::string> totalType;
 
@@ -66,11 +67,14 @@ std::any fromBytes(const std::vector<char>& bytes) {
 
 struct Val {
 	std::string typeName;								// 类型名称
+	long long dataSize;									// 数据大小
 	bool isPermanent;									// 是否永不过期
 	std::chrono::system_clock::time_point expireTime;	// 过期时间
 	std::chrono::system_clock::time_point updateTime;	// 更新时间
 	bool isDirty;										// 脏数据标记（true为脏，false为非脏）
 	std::any entity;									// 值实体
 };
+
+
 
 #endif // !_DATA_TYPE_H_
