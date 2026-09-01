@@ -193,13 +193,17 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 		rwMutex->lock();
 		auto it = cache_db.find(varName);
 		if (it != cache_db.end()) {	// 解锁后可能已被并发删除
-			it->second.updateTime = std::chrono::system_clock::now();	// 更新"更新时间"
-			// 当发现查询的数据过期了，则需要删除
-			if (!it->second.isPermanent && it->second.updateTime > it->second.expireTime) {
-				LRU_removeNode(it->first);
-				cache_db.erase(it);
-				diskThread->submit([this, varName]() { return disk->persisData(varName); }, CACHE_TASK);
+			// 过期检查：过期则删缓存（链表 + 大小），提交磁盘删除任务（防从磁盘复活），返回 EXPIRED
+			if (!it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now()) {
+				LRU_removeNode(it->first);			// 更新链表
+				curSize -= it->second.dataSize;		// 更新缓存当前大小
+				cache_db.erase(it);					// 删除该数据
+				diskThread->submit([this, varName]() { return disk->delData(varName); }, CACHE_TASK);
+				rwMutex->unlock();
+				resCode = EXPIRED;	// 数据已过期
+				return;
 			}
+			it->second.updateTime = std::chrono::system_clock::now();	// 更新"更新时间"
 			LRU_moveToHead(varName);	// 移到链表头（最近使用）
 		}
 		rwMutex->unlock();
@@ -254,19 +258,23 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 std::future<int> Cache::delData(const std::string& varName)
 {
 	// 锁内只做"查 + 删"，粒度最小
+	bool cacheHit = false;	// 缓存是否命中（命中即已删除，磁盘无记录不算失败）
 	rwMutex->lock();
 	auto it = cache_db.find(varName);
 	if (it != cache_db.end()) {
 		LRU_removeNode(varName);		// 更新链表
 		curSize -= it->second.dataSize;	// 更新缓存当前大小
 		cache_db.erase(it);				// 命中：从缓存移除
+		cacheHit = true;
 	}
 	rwMutex->unlock();
 
-	// 提交磁盘删除任务：磁盘线程检查 inDisk（存在则标记 delDisk），只动内存标记不进文件
+	// 提交磁盘删除任务：磁盘线程检查 inDisk（存在则删除索引），只动内存标记不进文件
 	// 任务不引用捕获调用者变量（异步执行时调用者栈帧可能已销毁），结果走 future 通道
-	return diskThread->submit([this, varName]() {
-		return disk->delData(varName);
+	// 缓存命中但磁盘无记录（数据从未落盘）：删除已生效，返回成功；缓存磁盘都没有才算未找到
+	return diskThread->submit([this, varName, cacheHit]() {
+		int code = disk->delData(varName);
+		return (code == FIND_FAILED && cacheHit) ? SUCCESS : code;
 	}, CACHE_TASK);
 }
 

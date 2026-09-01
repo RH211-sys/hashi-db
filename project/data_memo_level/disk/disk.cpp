@@ -594,7 +594,10 @@ int Disk::reWrite()
         {
             c->rwMutex->lock_shared();	// 读锁内拷贝 Val，锁外使用
             auto it = c->cache_db.find(name);
-            if (it == c->cache_db.end()) return FIND_FAILED;	// 缓存没有
+            if (it == c->cache_db.end()) {
+                c->rwMutex->unlock_shared();	// 缓存没有：先解锁再返回，防止读锁泄漏
+                return FIND_FAILED;
+            }
             val = it->second;
             c->rwMutex->unlock_shared();
         }
