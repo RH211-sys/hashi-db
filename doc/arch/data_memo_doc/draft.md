@@ -1,140 +1,94 @@
-# 草稿（整理中）
+# MyDB 存储层回忆文档（2026-09-01，压缩上下文后先读此文件）
 
-## 重写机制 reWrite（定稿）
+## 项目概况
 
-**前置条件**：删除 = 纯内存 `inDisk.erase`，不落任何文件标记 → 不需要删除码，校验码两态（VALID / BROKEN）；崩溃后已删数据复活，允许回溯（可容忍）。
+- 个人 C++ 数据库项目：Windows + VS2022 + MSVC + CMake + C++20，所有文件 UTF-8
+- 当前阶段：存储层（data_memo_level）功能完成，测试全部 PASS；下阶段按「待办」优化
 
-**重写 = 整理所有数据**：过期缓存数据删掉（缓存删 + inDisk 索引删），剩余有效数据全部紧凑写到文件前部，截断掉尾部空洞。
+## 代码结构
 
-**流程**：
+- `project/data_memo_level/`
+  - `controller/` — Controller 统一入口（组装 Cache/Disk/DiskThread，同步返回 int）
+  - `cache/` — Cache：缓存 + LRU 淘汰
+  - `disk/` — Disk：持久化（追加写 + 两段式校验码）
+  - `common/` — WritePrefMutex（写优先读写锁）
+  - `controller/taskThreads.h` — ReadPool（读线程池，预留未用）/ WriteThread（预留未用）/ DiskThread（磁盘单线程，双队列差距调度，submit 返回 future）
+  - `data_type.h` — Val 结构 + typeReg 类型注册表 + DEFINE_DATA_TYPE / THE_SIZE 宏
+  - `protocol.h` — 错误码 + 磁盘协议常量
+- `test/memo_test/test1/` — 功能测试工程（memo_test1，VS 可单独启动）
+- main.cpp 已删除；根 CMakeLists 中 myDB 主程序目标已注释（测试期）
 
-1. **删过期缓存数据**（写锁内 while 遍历）：缓存删除 + inDisk 索引删除 → 磁盘记录留空洞，主循环不再搬移它（防复活）
-2. 对 inDisk 的偏移量排序（临时 `vector` 拷贝 + `sort`，重写低频，不必常驻有序结构），从偏移量小的开始遍历
-3. 每条记录走 `writeCacheData(name)`（内部：读锁拷贝 Val → 检查/序列化 → 写锁清 isDirty → 写到写游标位置，更新 inDisk/写游标）
-   - 缓存存在 → 写缓存数据（不管是否脏，缓存是权威）
-   - 缓存不存在（返回 FIND_FAILED）→ 从磁盘整条搬到紧凑位置（读一条 → 写一条，校验码原样搬移）
-4. **补写缓存中 inDisk 没有的数据**（全新未刷盘）：读锁收集名字，逐个 `writeCacheData`（此时所有旧记录已处理完，无未读记录，写游标天然安全）
-5. `file.flush()` **先**刷到页缓存，再 `std::filesystem::resize_file` 截断到写游标位置
-   - resize 不经过 fstream 缓冲（直接作用文件系统），**必须在 flush 之后**，否则截断时新数据还在流缓冲里，截的是旧文件状态
-6. `curSize = writePos` 重新统计
+## 关键设计
 
-**安全性的保证**：写游标（紧凑总长）≤ 下一个待读偏移——**搬移（等长）严格成立**；但缓存分支写的是新数据，可能比旧记录长，变长部分靠前面跳过的空洞/已删数据吸收，空洞不足时可能覆盖未读记录（极端情况，待处理）。
+### 错误码（protocol.h）
+SUCCESS=200 / KEY_EXIST=201 / FIND_FAILED=202 / TYPE_VALID=203 / EXPIRED=204 / MEMO_OUT=300 / LONG_NAME=301 / UNKNOWN_ERROR=400 / FILE_OPEN_FILED=500
 
-**崩溃处理**：原地重写中途崩溃 = 数据全损（文件半新半旧、偏移全乱）。概率极小，极端情况，交运维（事先备份文件）。防止崩溃的两文件方案（新文件 + 删旧文件）会把磁盘利用率降一半，用于防止极端情况大材小用。后面若真要防重写崩溃，理应在管理层做文件备份。
+### 磁盘记录布局
+`[校验码 1B][实体大小 4B][更新时间 8B(微秒)][过期时间 8B(微秒,永久写0)][是否永久 1B][类型名 32B][变量名 32B][实体 dataSize]`，头部固定 86B
+- **追加写**：旧记录留空洞，inDisk 指向最新偏移，reWrite 回收空洞
+- **两段式写**：先写 CHECK_BROKEN 整条，写完回写 CHECK_VALID（写一半崩溃 → 重建截断）
+- 类型名必须落盘：std::any 类型擦除，读盘靠 typeName 查注册表反序列化
 
-## 磁盘记录布局（最新定稿）
+### 缓存与 LRU
+- Cache：`unordered_map<string, Val> cache_db` + WritePrefMutex + LRU 哈希链表（哨兵 start/end，头=最近，尾=最久）
+- Val：typeName / dataSize / isPermanent / expireTime / updateTime / isDirty / entity(std::any)
+- **LRU_out**：目标 curSize < 0.9×memoSize；先删过期（缓存 + inDisk 索引，防复活），再尾部采样 15 个算分入大顶堆 `priority_queue<pair<double,string>>`
+- **分数 = 时间档位×30 + ln(dataSize)**；五档 <1min/<1h/<1d/<7d/≥7d，档距 30 > ln(memoSize) 上限
+- 脏数据淘汰：锁内 `val = std::move(it->second)` 移动出迭代器 → 删链表/缓存/curSize → 锁外提交 `disk->persisData(victim, val)`（带 Val 版，DISK_TASK，提交即返回不等待）
+- 所有增长点（插入/回填/改大）锁外 `if (curSize > memoSize) LRU_out()`
 
-```
-[校验码 CODE_LEN=1] [实体大小 ENTITY_SIZE_LEN=4] [时间信息 TIME_INFO_LEN=17] [类型名 TYPE_LEN=32] [变量名 NAME_LEN=32] [实体 dataSize]
-时间信息顺序：更新时间(8B, 微秒整数) + 过期时间(8B, 微秒整数) + 是否永久(1B, 永久=1/非永久=0)
-```
+### 接口语义（Controller 同步返回 int）
+- **addData**：缓存或磁盘已有 → KEY_EXIST；**不主动刷盘**（落盘靠淘汰/flushDisk/persisAll）
+- **selData**：命中缓存先检查过期（过期 → 删缓存+链表+curSize+提交磁盘删除任务 → EXPIRED）；未命中走磁盘，回填前锁外检查过期（过期 → 提交磁盘删除 → EXPIRED）；回填后超限触发 LRU_out
+- **modData**：命中替换标脏；未命中查磁盘存在则回填标脏（不主动刷盘）
+- **delData**：缓存命中删除即算成功，磁盘无记录（从未落盘）不算失败；缓存磁盘都没有 → FIND_FAILED
+- **persisVar（无 Val 版）**：从缓存取数据，**缓存没有 → FIND_FAILED**（被淘汰的数据无法 persisVar）
+- **persisAll**：收集缓存中未过期脏数据批量写；**flushDisk**：删缓存中过期数据 + 刷全部脏数据
+- **reWrite**：整理所有数据到文件前部 + resize_file 截断回收空洞；原地重写，崩溃=数据全损交运维（概率极小，双文件方案大材小用）
 
-- **头部固定 = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN = 86B**（TYPE_LEN 32 / NAME_LEN 32，写不满补 '\0'，超长返回 LONG_NAME）
-- 布局改动时只改 protocol.h 协议常量，代码各处统一引用（时间字段常量名：UPDATE_TIME_LEN）
-- 时间戳与 `std::chrono::system_clock::time_point` 用微秒整数互转；永久数据的过期时间写 0，读回时永久数据的 expireTime 直接设为 updateTime（不使用）
+### 设计结论（原 draft 摘要，勿推翻）
+- isDirty 先清后写：写文件前锁内清脏，写失败置回，防写文件期间新修改被误清
+- 删除 = 纯内存 inDisk.erase，不落文件标记；崩溃后已删数据复活可容忍
+- MVCC 不采用（锁临界区微秒级，瓶颈在磁盘 IO；多版本内存翻倍）
+- 不用字节缓冲方案（数据存两份内存翻倍）
+- 批量持久化：一次文件开关写多条
 
-**类型名为什么要落盘**：selData 读盘后要按 typeName 查注册表才能反序列化（std::any 类型擦除，C++ 无反射），缓存中又查不到 → 磁盘记录必须带 typeName。
+### 线程
+- DiskThread：单线程双队列（cacheTasks 快 / diskTasks 慢），差距调度（缓存优先，taskGap 到 upEdge=15 让位磁盘一个任务）；submit 返回 future，get() 阻塞；析构处理完队列后 join
+- Cache 持 Disk/DiskThread 的 shared_ptr（注入），Controller 也持 shared_ptr 共享所有权
 
-## updateTime 改造（为 LRU 准备）
+### 类型注册
+- `DEFINE_DATA_TYPE(name)`：totalType.insert + typeReg.emplace（序列化/反序列化函数），**必须在函数作用域内调用**（全局作用域 MSVC 解析为声明报 C3927）
+- 用户类型必须实现：静态 getClassName / 模板 serialize / 静态 theSize
 
-- Val 字段 `createTime` → **`updateTime`**：addData 赋初值、modData 命中/回填时锁内更新为 now
-- 磁盘布局**不变**（8B 字段），只改写入值语义：写盘/读回都用 updateTime → 重建后 LRU 状态可恢复
-- 旧文件读回后 updateTime = 旧创建时间，启动即视为冷数据，可接受
-- 协议常量 `CREATE_TIME_LEN` → `UPDATE_TIME_LEN`
+## 测试
 
-## 追加写（改动：不覆盖）
+- 结构：根 CMakeLists `add_subdirectory(test)` → test/CMakeLists.txt → test/memo_test/CMakeLists.txt（自动收集子测试目录 + STORAGE_SOURCES 共享 project/*.cpp，排除 third_party）→ 子测试各自 add_executable
+- test1 功能测试（全 PASS）：增/查/改/删/过期/LRU 淘汰回填/修改后淘汰落盘/persisVar/persisAll/flushDisk/reWrite
+- 运行：VS 启动 memo_test1；断言输出 [PASS]/[FAIL] 并计数，失败返回码 1
+- cout 输出用英文（VS 控制台编码问题）；数据文件 test1_data.dat 测试后删除
+- 测试配置：缓存 64KB（触发 LRU），磁盘 64MB
 
-- **一律追加写**：旧记录长度与新记录无法保证一致，覆盖会产生碎片；旧记录留空洞，等重写回收
-- 同名变量可能有多条记录（旧版本），`inDisk` 指向最新一条；重建时后读到的同名记录覆盖偏移（自然淘汰旧版本）
-- `curSize` 只增不减（空洞/已删数据不回收），重写时重新统计
+## 本轮修复的 Bug（已修复）
 
-## 两段式写（物理 IO 代价）
+1. **reWrite 死锁**：writeCacheData 缓存未命中分支直接 return 未 unlock_shared → 读锁泄漏，后续写锁永久等待 → 先解锁再返回
+2. **delData 语义**：缓存命中删除成功，磁盘无记录不算失败
+3. **selData 命中路径无过期检查**：命中已过期数据返回 SUCCESS → 加过期检查（删缓存+链表+curSize+提交磁盘删除+EXPIRED）
 
-- 先写 `CHECK_BROKEN` 整条，写完回写 `CHECK_VALID`（写一半崩溃 → 校验码无效，重建时截断）
-- **物理层面 ≈ 1 次磁盘 IO**：整条写入进页缓存后，回写校验码只是缓存页内覆盖 1 字节，不触发额外落盘
-- `flush()` 只刷到 OS 页缓存，不强制落盘（fsync 才强制）→ 持久化便宜，代价是崩溃丢最近数据、靠重建截断兜底
+## 待办（下阶段，按用户要求）
 
-## isDirty 时序（写文件前先清）
+1. **磁盘模块持久化代码组织**：封装序列化/反序列化接口，把 persisData 三个重载 + reWrite writeCacheData 重复的「检查→序列化→写记录→更新 inDisk/curSize」流程统一封装
+2. **调用读线程池读缓存（lock_shared）**：ReadPool 已实现未启用，读任务走读线程池并发
+3. **拷贝改移动，零拷贝**：C++ 语法特性优化热点路径（如 selData `res = it->second.entity`、Val 传递、批量 vector 收集）
+4. **磁盘线程挂后台，controller 异步化**：调用立即返回，查返回码时再阻塞；该异步的异步，不要同步——controller 同步缓存后同步调用磁盘是性能问题，controller 应返回 future
 
-- **写文件前**（写锁内）把缓存中该变量 `isDirty` 置 false，**写失败再置回 true**
-- 原因：若写文件后才清，磁盘线程写文件（锁外毫秒级）期间缓存被 modData 修改（新脏数据），写锁等锁后把 isDirty 置 false 会**误清新脏标记**
-- 先清后写：写文件期间若有新修改，会重新置 true 并保留 → 磁盘写的是旧快照，新修改保持脏，下次再刷，不丢
-- 批量版：记录已清 `clearedNames`，最终 `flush` 失败时统一置回
+## 未实现
 
-**等锁期间其他线程修改 → 无影响（结论）**：磁盘等的是读锁（拷贝 Val）或写锁（清 isDirty），拿到锁后看到的是最新数据；真正的竞态窗口（清 isDirty 后、写文件期间）由"先清后写"兜住。
+- 启动时从数据文件扫描恢复 inDisk 索引（重建）：交给管理层，磁盘模块不做
 
-## flushDisk（定稿）
+## 用户工作偏好（重要）
 
-- 写锁内一次 while 遍历：
-  - **过期数据**：缓存删除 + inDisk 索引删除（磁盘记录留空洞等重写回收，**防止从磁盘复活**）
-  - **未过期脏数据**：收集变量名，锁外批量刷盘（复用 persisData 列表版）
-- 与 persisAll 的区别：persisAll 只跳过过期（不删），flushDisk 会删过期数据
-
-## 删除竞态（已确认无问题）
-
-- 疑点：delData 删缓存后、磁盘任务排队期间，并发 selData 可能从磁盘读回回填（白删）
-- **结论**：缓存删 + 磁盘 inDisk 删两处都有做删除处理，不需要额外处理
-
-## 批量持久化
-
-- 一次文件开关写入多条记录（列表版 / persisAll），减少物理磁盘 IO 频率（多条数据可能合并为一次页缓存落盘）
-- 接口参数用 `std::vector<std::string>`（persisData 列表版 / selData 列表版都是 vector）
-
-## 序列化方案（cereal + 类型注册表）
-
-- 第三方库：**cereal**（header-only，零依赖，`project/third_party_lib/cereal_lib`）
-- 注册表：`typeName → {序列化函数, 反序列化函数}`，`DEFINE_DATA_TYPE(name)` 宏注册（扩展了原 totalType 宏）
-- 用户自定义类型必须提供成员模板 `template <class Archive> void serialize(Archive&)`（string/vector/嵌套结构体自动支持）
-- **不用字节缓冲方案**（Val 加 entityBytes）：数据存两份，缓存内存翻倍、阈值降低、IO 更频繁
-
-## 错误码（更新）
-
-```
-SUCCESS = 200 / KEY_EXIST = 201 / FIND_FAILED = 202 / TYPE_VALID = 203（未注册类型）
-MEMO_OUT = 300 / LONG_NAME = 301（名称过长，变量名/类型名共用）/ UNKNOWN_ERROR = 400 / FILE_OPEN_FILED = 500
-```
-
-## LRU 淘汰（讨论中，未定稿）
-
-**需求**：缓存超出阈值（curSize > memoSize）时，结合「最近使用」+「数据大小」的权重分数排序，淘汰分数最高的若干数据，直到 `curSize ≤ 阈值`。
-
-**候选公式**（倾向第三种，可能对时间/大小取 log）：
-
-```
-分数 = f(最近最少使用排序的位次) + g(数据大小位次)
-分数 = f(最近最少使用排序的位次) + g(数据大小)
-分数 = f(最近使用时间间隔) + g(数据大小)  ← 大概率选这种
-```
-
-**待定项**：
-- a/b 权重系数（时间间隔 μs 级数字大、大小字节级，直接相加会被大数值维度主导 → 需要权重或归一化，或取 log）
-- 淘汰方向：分数大 = 优先淘汰（间隔越大越该淘汰）
-- 数据结构：类似力扣 LRU 的变体（哈希表 + 双向链表记录访问序）
-- 淘汰的数据要不要同步删磁盘索引（防复活，与删除竞态同一个坑）
-- 淘汰掉未落盘的脏数据 = 数据丢失，是否可接受
-
-## 磁盘模块实现进度（全部完成）
-
-- ✅ delData：纯内存 `inDisk.erase`，0 IO
-- ✅ persisData 单变量版 / 列表版（vector）：追加写 + 两段式 + isDirty 先清后写（列表版批量失败统一置回）
-- ✅ persisAll：读锁内收集未过期脏数据（非脏不存、过期不存），复用列表版批量写入
-- ✅ selData 单变量版 / 列表版（vector，resSet + vals 返回实体和时间信息）
-- ✅ flushDisk：写锁内删过期缓存数据（缓存删 + inDisk 删防复活）+ 收集未过期脏数据批量刷盘
-- ✅ reWrite：整理所有数据（删过期缓存 → 偏移排序 → 缓存有写/无搬移 → 补写缓存新数据 → flush → resize_file 截断）
-- ➡️ 重建 inDisk（启动扫描）：**交给管理层**，磁盘模块不做
-- ⬜ 缓存模块：LRU 淘汰、modData 属性版、过期数据删除接口
-- ⬜ Controller 同步（旧签名、shared_ptr 注入、setDiskThread 绑定）
-
-## MVCC 讨论结论（不采用）
-
-用版本控制代替读写锁的可行性分析：**不采用**。理由：
-
-- 锁临界区微秒级（锁内只做检查/替换/拷贝），无锁化省下的开销对比磁盘 IO（毫秒级）约等于零，瓶颈不在锁
-- MVCC 多版本 = 实体数据存多份，内存翻倍（与"不用字节缓冲"的理由冲突）
-- 版本回收（读者用完后才可删）需要引用计数追踪，复杂度高
-- 检查-动作语义（同名冲突检测、检查-替换）仍需互斥/原子操作，不能完全无锁
-- 若目的只是"磁盘线程不被锁卡住"，更轻的方案是读快照 + COW（shared_ptr 引用计数自动回收）
-
-
-
-**`<fstream>` 用于读写文件内容，`<filesystem>` 用于操作文件和目录本身。**
+- 只写用户要求的代码；不要动用户的注释
+- 有问题先提问，不要猜测，不要乱想
+- 回答简洁；讨论确认后再写代码
+- 忽略 clangd 报错（用户用 MSVC；clangd 因 cereal include 路径未配置级联报错）
