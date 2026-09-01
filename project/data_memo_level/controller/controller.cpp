@@ -1,30 +1,49 @@
-﻿#include "controller.h"
+#include "controller.h"
 
 
-Controller::Controller(long long memoSize, long long maxSize, size_t poolThreadNum)
+Controller::Controller(long long memoSize, long long maxSize, size_t poolThreadNum, std::string dbName)
 {
-	this->cache = std::make_unique<Cache>(memoSize);
-	this->disk = std::make_unique<Disk>(maxSize);
-	this->pool = std::make_unique<ThreadPool>(poolThreadNum);
-	cache->setDisk(disk.get());	// setDisk/setCache 接收裸指针，用 .get() 取出
-	disk->setCache(cache.get());
+	cache = std::make_shared<Cache>(memoSize);
+	disk = std::make_shared<Disk>(maxSize, dbName);
+	readPool = std::make_unique<ReadPool>(poolThreadNum);
+	writeThread = std::make_unique<WriteThread>();
+	diskThread = std::make_shared<DiskThread>();
+
+	// 注入依赖：Cache 持 Disk/DiskThread 的 shared_ptr，Disk 持 Cache 的 weak_ptr（无循环引用）
+	cache->setDisk(disk);
+	cache->setDiskThread(diskThread);
+	disk->setCache(cache);
 }
 
-int Controller::delData(const std::string& varName) {
-	return 0;
+int Controller::delData(const std::string& varName)
+{
+	return cache->delData(varName).get();	// 同步等待磁盘删除完成
 }
 
-int Controller::selData(const std::string& varName, std::any& res) {
-	return 0;
+int Controller::selData(const std::string& varName, std::any& res)
+{
+	int resCode;
+	cache->selData(varName, res, resCode);
+	return resCode;
 }
 
+int Controller::persisVar(const std::string& varName)
+{
+	return cache->persisVar(varName).get();
+}
 
-int Controller::persisVar(const std::string& varName) {
-	return 0;
+int Controller::persisAll()
+{
+	return cache->persisVar().get();
 }
-int Controller::flushDisk() {
-	return 0;
+
+int Controller::flushDisk()
+{
+	// 磁盘 IO 统一在磁盘线程执行，不占调用线程
+	return diskThread->submit([this]() { return disk->flushDisk(); }, DISK_TASK).get();
 }
-int Controller::reWrite() {
-	return 0;
+
+int Controller::reWrite()
+{
+	return cache->reWrite().get();
 }

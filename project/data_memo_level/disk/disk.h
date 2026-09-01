@@ -3,7 +3,7 @@
 #define _DISK_H_
 
 #include "../data_type.h"
-#include "../cache/cache.h"
+#include <vector>
 #include <list>
 #include <unordered_map>
 

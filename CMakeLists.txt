@@ -28,11 +28,13 @@ file(GLOB_RECURSE MYDB_SOURCES
     CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/project/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/project/third_party"
 )
+# 排除第三方库源码（cereal 自带 sandbox/unittests 依赖 boost，不参与构建）
+list(FILTER MYDB_SOURCES EXCLUDE REGEX "third_party_lib")
 
 # ============ 生成可执行文件 ============
-add_executable(myDB ${MYDB_SOURCES} "project/data_memo_level/cache/cache.cpp" "project/data_memo_level/data_type.h" "project/data_memo_level/disk/disk.cpp")
+# 源文件已由上方 GLOB_RECURSE 收集（project/*.cpp），此处不再重复列出
+add_executable(myDB ${MYDB_SOURCES})
 
 # 头文件搜索路径：代码统一在 project/ 下，include 时从层名开始写
 # 例如 #include "data_memo_level/memory/memo.h"

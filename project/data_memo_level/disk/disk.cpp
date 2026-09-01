@@ -1,4 +1,5 @@
 #include "disk.h"
+#include "../cache/cache.h"	// 方法实现需访问 Cache 完整类型（友元 + 私有成员）
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
