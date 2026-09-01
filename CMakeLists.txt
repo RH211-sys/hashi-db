@@ -21,31 +21,32 @@ else()
     add_compile_options(-Wall -Wextra)
 endif()
 
-# ============ 源文件 ============
+# ============ 主程序（暂停用：main.cpp 已删除，测试期只构建测试项目，恢复时取消注释） ============
 # 递归收集 project/ 下各层（data_memo_level / command_map_level / net_level ...）的 .cpp
 # CONFIGURE_DEPENDS 会在新增文件后自动重新配置
-file(GLOB_RECURSE MYDB_SOURCES
-    CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/project/*.cpp"
-)
-# 排除第三方库源码（cereal 自带 sandbox/unittests 依赖 boost，不参与构建）
-list(FILTER MYDB_SOURCES EXCLUDE REGEX "third_party_lib")
-
-# ============ 生成可执行文件 ============
-# 源文件已由上方 GLOB_RECURSE 收集（project/*.cpp），此处不再重复列出
-add_executable(myDB ${MYDB_SOURCES})
-
-# 头文件搜索路径：代码统一在 project/ 下，include 时从层名开始写
-# 例如 #include "data_memo_level/memory/memo.h"
-target_include_directories(myDB PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/project"
-    "${CMAKE_CURRENT_SOURCE_DIR}/project/third_party_lib/cereal_lib/include"
-)
+# file(GLOB_RECURSE MYDB_SOURCES
+#     CONFIGURE_DEPENDS
+#     "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
+#     "${CMAKE_CURRENT_SOURCE_DIR}/project/*.cpp"
+# )
+# # 排除第三方库源码（cereal 自带 sandbox/unittests 依赖 boost，不参与构建）
+# list(FILTER MYDB_SOURCES EXCLUDE REGEX "third_party_lib")
+#
+# # ============ 生成可执行文件 ============
+# # 源文件已由上方 GLOB_RECURSE 收集（project/*.cpp），此处不再重复列出
+# add_executable(myDB ${MYDB_SOURCES})
+#
+# # 头文件搜索路径：代码统一在 project/ 下，include 时从层名开始写
+# # 例如 #include "data_memo_level/memory/memo.h"
+# target_include_directories(myDB PRIVATE
+#     "${CMAKE_CURRENT_SOURCE_DIR}/project"
+#     "${CMAKE_CURRENT_SOURCE_DIR}/project/third_party_lib/cereal_lib/include"
+# )
 
 # ============ 可选：链接第三方库 ============
 # find_package(SomeLib REQUIRED)
 # target_link_libraries(myDB PRIVATE SomeLib::SomeLib)
 
-# ============ 可选：测试子目录 ============
-# add_subdirectory(tests)
+# ============ 测试子目录 ============
+# 存储层测试：test/memo_test/ 下每个子目录是一个独立可执行测试项目（VS 中可单独设为启动项）
+add_subdirectory(test)

@@ -193,7 +193,13 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 		rwMutex->lock();
 		auto it = cache_db.find(varName);
 		if (it != cache_db.end()) {	// 解锁后可能已被并发删除
-			it->second.updateTime = std::chrono::system_clock::now();	// 刷新访问时间
+			it->second.updateTime = std::chrono::system_clock::now();	// 更新"更新时间"
+			// 当发现查询的数据过期了，则需要删除
+			if (!it->second.isPermanent && it->second.updateTime > it->second.expireTime) {
+				LRU_removeNode(it->first);
+				cache_db.erase(it);
+				diskThread->submit([this, varName]() { return disk->persisData(varName); }, CACHE_TASK);
+			}
 			LRU_moveToHead(varName);	// 移到链表头（最近使用）
 		}
 		rwMutex->unlock();
