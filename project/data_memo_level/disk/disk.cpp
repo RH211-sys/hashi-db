@@ -233,7 +233,7 @@ int Disk::persisData(const std::string& varName, const Val& val)
     return SUCCESS;
 }
 
-int Disk::persisData(std::vector<std::string>& varNameSet)
+int Disk::persisData(std::vector<std::string> varNameSet)
 {
     if (varNameSet.empty()) return SUCCESS;
 
@@ -381,7 +381,7 @@ int Disk::persisAll()
     }
 
     // 复用列表版批量写入（一次文件开关，写前清 isDirty，失败统一置回）
-    return persisData(dirtyNames);
+    return persisData(std::move(dirtyNames));
 }
 
 int Disk::selData(const std::string& varName, std::any& res, Val& val)
@@ -547,7 +547,7 @@ int Disk::flushDisk()
         复用persisData重载（一次文件开关，写前清 isDirty，失败统一置回）
         inDisk 中已存在的数据：追加写后偏移覆盖为最新（逻辑覆盖），旧记录成空洞等重写回收
     */
-    return persisData(flushNames);
+    return persisData(std::move(flushNames));
 }
 
 int Disk::reWrite()

@@ -31,6 +31,7 @@ double Cache::LRU_score(Val& val) {
 	static constexpr long long HOUR_US = 60LL * MIN_US;				// 1h
 	static constexpr long long DAY_US = 24LL * HOUR_US;				// 1d
 	static constexpr long long WEEK_US = 7LL * DAY_US;				// 7d
+	static constexpr double LEVEL_DIS = 30.0;						// 档距
 	int level = 0;
 	if (intervalUs < MIN_US)		level = 0;
 	else if (intervalUs < HOUR_US)	level = 1;
@@ -40,7 +41,7 @@ double Cache::LRU_score(Val& val) {
 
 	// 分数 = 档位 * 档距 + ln(dataSize)；dataSize 下限取 1 防 ln(0)
 	long long ds = val.dataSize > 0 ? val.dataSize : 1;
-	return level * 30.0 + std::log(static_cast<double>(ds));
+	return level * LEVEL_DIS + std::log(static_cast<double>(ds));
 }
 
 void Cache::LRU_out()
@@ -172,48 +173,64 @@ void Cache::LRU_removeNode(const std::string& varName)
 
 /* =============== public =============== */
 
-void Cache::setDisk(std::shared_ptr<Disk> d)
+void Cache::bind(std::shared_ptr<DiskThread> diskThread, std::shared_ptr<Disk> d, std::shared_ptr<ReadPool> readPool, std::shared_ptr<WriteThread> writeThread)
 {
 	this->disk = d;
-}
-
-void Cache::setDiskThread(std::shared_ptr<DiskThread> t)
-{
-	this->diskThread = t;
+	this->diskThread = diskThread;
+	this->readPool = readPool;
+	this->writeThread = writeThread;
 }
 
 void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
-	// 获取读共享锁
-	rwMutex->lock_shared();
-	// 命中缓存直接返回（缓存数据必定最新，且效率高）
-	if (cache_db.contains(varName)) {
-		res = cache_db.at(varName).entity;	// 返回值的实体，不是整个 Val
-		rwMutex->unlock_shared();
-		// 命中刷新：短写锁更新访问时间 + 移到链表头（读锁内不能升级写锁，解锁后重新查）
-		rwMutex->lock();
+	// 1. 缓存读交给读线程池：读锁内查缓存 + 过期判定，命中才拷贝实体；读任务内只碰读锁
+	// hit 三态：0=未命中，1=命中未过期，2=命中已过期
+	int hit = 0;
+	readPool->submit([this, &varName, &res, &hit]() {
+		rwMutex->lock_shared();
 		auto it = cache_db.find(varName);
-		if (it != cache_db.end()) {	// 解锁后可能已被并发删除
-			// 过期检查：过期则删缓存（链表 + 大小），提交磁盘删除任务（防从磁盘复活），返回 EXPIRED
-			if (!it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now()) {
-				LRU_removeNode(it->first);			// 更新链表
-				curSize -= it->second.dataSize;		// 更新缓存当前大小
-				cache_db.erase(it);					// 删除该数据
-				diskThread->submit([this, varName]() { return disk->delData(varName); }, CACHE_TASK);
-				rwMutex->unlock();
-				resCode = EXPIRED;	// 数据已过期
-				return;
+		if (it != cache_db.end()) {
+			bool expired = !it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now();
+			if (!expired) {
+				res = it->second.entity;	// 命中未过期：拷贝实体返回
 			}
-			it->second.updateTime = std::chrono::system_clock::now();	// 更新"更新时间"
-			LRU_moveToHead(varName);	// 移到链表头（最近使用）
+			hit = expired ? 2 : 1;
 		}
-		rwMutex->unlock();
+		rwMutex->unlock_shared();
+	}).get();
+
+	// 2. 命中未过期：直接返回；LRU 刷新（更新时间 + 移到链表头）异步交写线程，不等待结果
+	if (hit == 1) {
+		writeThread->push([this, varName]() {
+			rwMutex->lock();	// 写锁统一由写线程执行
+			auto it = cache_db.find(varName);
+			if (it != cache_db.end()) {	// 排队期间可能已被并发删除，跳过
+				it->second.updateTime = std::chrono::system_clock::now();	// 更新"更新时间"
+				LRU_moveToHead(varName);	// 移到链表头（最近使用）
+			}
+			rwMutex->unlock();
+		});
 		resCode = SUCCESS;
 		return;
 	}
-	// 未命中：先解锁，再走磁盘查询，避免持锁做磁盘 IO
-	rwMutex->unlock_shared();
 
-	// 提交磁盘读任务，只有发起者 get() 阻塞等待结果，其他线程不受影响
+	// 3. 命中已过期：返回 EXPIRED；删缓存交写线程（异步），并提交磁盘删除任务防从磁盘复活
+	if (hit == 2) {
+		writeThread->push([this, varName]() {
+			rwMutex->lock();
+			auto it = cache_db.find(varName);
+			if (it != cache_db.end()) {
+				LRU_removeNode(it->first);			// 更新链表
+				curSize -= it->second.dataSize;		// 更新缓存当前大小
+				cache_db.erase(it);					// 删除该数据
+			}
+			rwMutex->unlock();
+			diskThread->submit([this, varName]() { return disk->delData(varName); }, CACHE_TASK);
+		});
+		resCode = EXPIRED;	// 数据已过期
+		return;
+	}
+
+	// 4. 未命中：磁盘读走磁盘线程（同步等结果）
 	// disk 侧找到变量时填好 res（实体）和 val（时间信息：更新时间/是否永久/过期时间）
 	Val val;
 	std::future<int> fut = diskThread->submit([this, &varName, &res, &val]() {
@@ -225,7 +242,7 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 		return;
 	}
 
-	// 回填前检查过期：过期数据舍弃（不回填缓存），磁盘记录提交删除任务清理（防复活）
+	// 5. 锁外检查过期：过期数据舍弃（不回填缓存），磁盘记录提交删除任务清理（防复活）
 	// val 是本次查询的局部数据，无并发，锁外检查
 	{
 		auto now = std::chrono::system_clock::now();
@@ -236,40 +253,41 @@ void Cache::selData(const std::string& varName, std::any& res, int& resCode) {
 		}
 	}
 
-	// 回填缓存前重新校验 key（可能已被并发修改/删除），校验通过才回填
-	// disk 已填时间信息，缓存只补 isDirty 和 entity
-	{
-		rwMutex->lock();	// 回填是写操作，拿写锁
+	// 6. 回填缓存：写任务交写线程执行（锁内重校验插入），同步等待回填完成
+	writeThread->submit([this, varName, &res, &val]() {
+		rwMutex->lock();	// 回填是写操作，拿写锁（与读线程池并发读互斥）
 		if (!cache_db.contains(varName)) {
 			val.isDirty = false;	// 磁盘数据是干净的
-			val.entity = res;		// 实体从磁盘读回
+			val.entity = res;		// 实体从磁盘读回（res 仍要返回给调用者，拷入缓存一份）
 			val.updateTime = std::chrono::system_clock::now();	// 回填视为一次访问
 			cache_db.emplace(varName, std::move(val));	// 移动语义，避免拷贝
 			LRU_addNode(varName);			// 新数据头插（最近使用）
 			curSize += val.dataSize;		// 更新缓存当前大小
 		}
 		rwMutex->unlock();
-	}
+		// 回填会增大缓存：超限触发淘汰（写任务内锁外执行）
+		if (curSize > memoSize) LRU_out();
+	}).get();	// 同步等待回填完成
 	resCode = SUCCESS;
-	// 回填会增大缓存：超限触发淘汰
-	if (curSize > memoSize) LRU_out();
 }
 
 std::future<int> Cache::delData(const std::string& varName)
 {
-	// 锁内只做"查 + 删"，粒度最小
+	// 缓存删除是写操作：交写线程串行执行（锁内删 + 更新链表/大小），同步等结果拿 cacheHit
 	bool cacheHit = false;	// 缓存是否命中（命中即已删除，磁盘无记录不算失败）
-	rwMutex->lock();
-	auto it = cache_db.find(varName);
-	if (it != cache_db.end()) {
-		LRU_removeNode(varName);		// 更新链表
-		curSize -= it->second.dataSize;	// 更新缓存当前大小
-		cache_db.erase(it);				// 命中：从缓存移除
-		cacheHit = true;
-	}
-	rwMutex->unlock();
+	writeThread->submit([this, varName, &cacheHit]() {
+		rwMutex->lock();	// 写锁统一由写线程执行
+		auto it = cache_db.find(varName);
+		if (it != cache_db.end()) {
+			LRU_removeNode(varName);		// 更新链表
+			curSize -= it->second.dataSize;	// 更新缓存当前大小
+			cache_db.erase(it);				// 命中：从缓存移除
+			cacheHit = true;
+		}
+		rwMutex->unlock();
+	}).get();
 
-	// 提交磁盘删除任务：磁盘线程检查 inDisk（存在则删除索引），只动内存标记不进文件
+	// 磁盘删除仍走磁盘线程：检查 inDisk（存在则删除索引），只动内存标记不进文件
 	// 任务不引用捕获调用者变量（异步执行时调用者栈帧可能已销毁），结果走 future 通道
 	// 缓存命中但磁盘无记录（数据从未落盘）：删除已生效，返回成功；缓存磁盘都没有才算未找到
 	return diskThread->submit([this, varName, cacheHit]() {

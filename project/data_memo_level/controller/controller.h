@@ -17,8 +17,8 @@ class Controller {
 private:
 	std::shared_ptr<Cache> cache;				// 缓存对象（shared_ptr：Cache 内部持有 Disk/DiskThread 的 shared_ptr，需共享所有权）
 	std::shared_ptr<Disk> disk;					// 磁盘对象
-	std::unique_ptr<ReadPool> readPool;			// 读并发任务入口（暂未启用，预留上层并发调度）
-	std::unique_ptr<WriteThread> writeThread;	// 写任务（暂未启用，预留）
+	std::shared_ptr<ReadPool> readPool;			// 读并发任务入口（暂未启用，预留上层并发调度）
+	std::shared_ptr<WriteThread> writeThread;	// 写任务（Cache 持有其 shared_ptr，需共享所有权）
 	std::shared_ptr<DiskThread> diskThread;		// 磁盘任务线程（Cache 持有其 shared_ptr，需共享所有权）
 
 public:
@@ -41,9 +41,9 @@ public:
 		返回值：错误码，SUCCESS 成功 / KEY_EXIST 变量已存在
 	*/
 	template <typename T>
-	int addData(const std::string& varName, const T& entity, bool isPermanent, std::chrono::system_clock::duration during) {
+	int addData(const std::string& varName, T entity, bool isPermanent, std::chrono::system_clock::duration during) {
 		int resCode;
-		cache->addData(varName, entity, isPermanent, during, resCode);
+		cache->addData(varName, std::move(entity), isPermanent, during, resCode);
 		return resCode;
 	}
 
@@ -54,9 +54,9 @@ public:
 		返回值：错误码，SUCCESS 成功 / FIND_FAILED 变量不存在
 	*/
 	template <typename T>
-	int modData(const std::string& varName, const T& entity) {
+	int modData(const std::string& varName, T entity) {
 		int resCode;
-		cache->modData(varName, entity, resCode);
+		cache->modData(varName, std::move(entity), resCode);
 		return resCode;
 	}
 

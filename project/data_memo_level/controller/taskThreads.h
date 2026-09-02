@@ -97,6 +97,28 @@ public:
 		cv.notify_one();
 	}
 
+	/*
+		提交任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
+		任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
+		模板直接接收可调用对象（lambda 等），避免 std::function 模板推导失败
+		std::invoke_result_t<F>：F 无参调用得到的返回类型
+	*/
+	template <typename F>
+	std::future<std::invoke_result_t<F>> submit(F task) {
+		using R = std::invoke_result_t<F>;	// 任务返回类型，由可调用对象自动推导
+		auto ptask = std::make_shared<std::packaged_task<R()>>(std::move(task));
+		std::future<R> fut = ptask->get_future();
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			if (stop) {
+				return {};	// 已停止，拒绝新任务
+			}
+			tasks.push([ptask]() { (*ptask)(); });	// 通过 shared_ptr 延长任务对象生命周期
+		}
+		cv.notify_one();
+		return fut;
+	}
+
 	// 阻塞等待所有已提交任务执行完毕（队列清空且 busy 为 0）
 	void waitAll() {
 		std::unique_lock<std::mutex> lock(mtx);
@@ -171,6 +193,28 @@ public:
 			tasks.push(std::move(task));
 		}
 		cv.notify_one();
+	}
+
+	/*
+		提交任务并返回 future：只有调用者 get() 时阻塞等待结果，其他任务不受影响
+		任务抛异常时 packaged_task 自动将异常存入 future，get() 会重新抛出
+		模板直接接收可调用对象（lambda 等），避免 std::function 模板推导失败
+		std::invoke_result_t<F>：F 无参调用得到的返回类型
+	*/
+	template <typename F>
+	std::future<std::invoke_result_t<F>> submit(F task) {
+		using R = std::invoke_result_t<F>;	// 任务返回类型，由可调用对象自动推导
+		auto ptask = std::make_shared<std::packaged_task<R()>>(std::move(task));
+		std::future<R> fut = ptask->get_future();
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			if (stop) {
+				return {};	// 已停止，拒绝新任务
+			}
+			tasks.push([ptask]() { (*ptask)(); });	// 通过 shared_ptr 延长任务对象生命周期
+		}
+		cv.notify_one();
+		return fut;
 	}
 };
 

@@ -5,13 +5,12 @@ Controller::Controller(long long memoSize, long long maxSize, size_t poolThreadN
 {
 	cache = std::make_shared<Cache>(memoSize);
 	disk = std::make_shared<Disk>(maxSize, dbName);
-	readPool = std::make_unique<ReadPool>(poolThreadNum);
-	writeThread = std::make_unique<WriteThread>();
+	readPool = std::make_shared<ReadPool>(poolThreadNum);
+	writeThread = std::make_shared<WriteThread>();
 	diskThread = std::make_shared<DiskThread>();
 
 	// 注入依赖：Cache 持 Disk/DiskThread 的 shared_ptr，Disk 持 Cache 的 weak_ptr（无循环引用）
-	cache->setDisk(disk);
-	cache->setDiskThread(diskThread);
+	cache->bind(diskThread, disk, readPool, writeThread);
 	disk->setCache(cache);
 }
 

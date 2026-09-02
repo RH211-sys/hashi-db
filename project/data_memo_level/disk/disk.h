@@ -23,7 +23,7 @@ public:
 
 	/* ========== special operation 特殊操作 ========== */
 
-	inline bool containsVar(std::string varName) { return inDisk.contains(varName); }
+	inline bool containsVar(const std::string& varName) { return inDisk.contains(varName); }
 
 	/* ========== operation function(操作函数) ========== */
 
@@ -38,7 +38,7 @@ public:
 	// 持久化某变量（带数据版：数据由调用方提供，不查缓存，供淘汰刷盘用）
 	int persisData(const std::string& varName, const Val& val);
 	// 持久化某变量集
-	int persisData(std::vector<std::string>& varNameSet);
+	int persisData(std::vector<std::string> varNameSet);
 	// 持久化某个数据
 	
 	// 持久化所有数据
