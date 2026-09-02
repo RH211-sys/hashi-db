@@ -75,6 +75,12 @@ struct Val {
 	std::any entity;									// 值实体
 };
 
+// 查询结果：selData 的 future 返回体，一个 future 带回错误码与查询数据
+struct SelResult {
+	int resCode;		// 错误码（SUCCESS 成功 / FIND_FAILED 不存在 / EXPIRED 已过期）
+	std::any data;		// 查询到的实体（失败时为空）
+};
+
 
 
 #endif // !_DATA_TYPE_H_
