@@ -49,3 +49,9 @@ std::future<int> Controller::reWrite()
 	// 重写任务已在缓存模块内交磁盘线程执行，直接透传 future，调用方不阻塞
 	return cache->reWrite();
 }
+
+CacheStat Controller::getStat() const
+{
+	// 统计快照读自缓存模块（原子计数），直接透传
+	return cache->getStat();
+}

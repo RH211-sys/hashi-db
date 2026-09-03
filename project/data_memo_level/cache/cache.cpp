@@ -46,6 +46,17 @@ void Cache::evict()
 	// 由写线程调用（addData/modData/回填超限后触发），全程串行、阻塞执行至容量达标
 	long long target = memoSize * 9 / 10;
 	long long sizeNow = curSize;	// 当前大小（写线程串行上下文内维护）
+	// 淘汰统计（供 getStat() 观测淘汰对写吞吐的影响）：evict 只在写线程执行，原子累加无争抢
+	auto evStart = std::chrono::steady_clock::now();
+	long long evictItems = 0;	// 本次淘汰条目数（过期清理 + 采样淘汰）
+	auto evDone = [&]() {		// 出口统一记账（evict 有多个结束点，避免漏记）
+		statEvictCnt.fetch_add(1, std::memory_order_relaxed);
+		statEvictItems.fetch_add(evictItems, std::memory_order_relaxed);
+		statEvictUs.fetch_add(static_cast<long long>(
+			std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - evStart).count()),
+			std::memory_order_relaxed);
+	};
 
 	// 1. 先批量删过期数据（独占锁内全遍历：先清过期垃圾，避免把活数据误淘汰）
 	//    全遍历只在写线程的淘汰路径发生（低频、阻塞任务），不在读路径上
@@ -59,6 +70,7 @@ void Cache::evict()
 			Val& v = it->second;
 			if (!v.isPermanent && now >= v.expireTime) {
 				expiredNames.push_back(it->first);	// 更新删除集
+				++evictItems;						// 淘汰条目统计（过期清理）
 				curSize -= v.dataSize;				// 更新缓存当前大小
 				it = cache_db.erase(it);			// 删除该数据
 			} else {
@@ -74,7 +86,7 @@ void Cache::evict()
 			return disk->delData(std::move(expiredNames));
 		}, CACHE_TASK).get();	// 写线程短暂等待磁盘线程快速任务
 	}
-	if (sizeNow <= target) return;	// 删完过期已达目标，无需采样淘汰
+	if (sizeNow <= target) { evDone(); return; }	// 删完过期已达目标，无需采样淘汰
 
 	// 2. 全局采样淘汰（无 LRU 链表）：不遍历整个缓存，从 cache_db 随机取样本算分入大顶堆
 	//    分数高 = 最优先淘汰；每轮直接取堆顶，堆空才补采一批（不每轮重采样）
@@ -120,12 +132,14 @@ void Cache::evict()
 			dirty = it->second.isDirty;
 			if (!dirty) {
 				// 干净数据：锁内直接删（磁盘已有副本，inDisk 不动，可读回）
+				++evictItems;					// 淘汰条目统计
 				curSize -= it->second.dataSize;	// 更新缓存当前大小
 				cache_db.erase(it);				// 删除该数据
 			}
 			else {
 				// 脏数据：Val 拷贝出（shared_ptr 只增引用计数），随后删缓存减 curSize，不等待刷盘结果
 				val = it->second;
+				++evictItems;				// 淘汰条目统计
 				curSize -= val.dataSize;	// 拷贝后从 val 取大小
 				cache_db.erase(it);
 			}
@@ -136,12 +150,13 @@ void Cache::evict()
 			若干净数据已删除，则处理下一个候选 
 			否则是脏数据：提交刷盘任务，提交即返回，不等待
 		*/
-		if (dirty) {	
+		if (dirty) {
 			diskThread->push([this, victim, val = std::move(val)]() {
 				disk->persisData(victim, val);
 				}, DISK_TASK);
 		}
 	}
+	evDone();	// 采样循环结束（容量已达标或缓存已空）：统一记账
 }
 
 /* =============== public =============== */
@@ -173,11 +188,13 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 		}
 
 		if (inCache && !expired) {
-			// 命中未过期：直接返回实体指针（不刷新时间/顺序信息，命中路径零写零任务）
+			// 命中未过期：直接返回实体指针（不刷新时间/顺序信息，命中路径唯一的原子写 = 统计自增）
+			statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计
 			return SelResult{ SUCCESS, std::move(entity) };
 		}
 		if (inCache && expired) {
 			// 命中已过期：返回 EXPIRED；清理交两条平级任务（写线程删缓存 + 磁盘线程删 inDisk），提交即返回不等待
+			statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计：缓存中存在即算命中（含过期，TTL 语义由清理管）
 			writeThread->push([this, varName]() {
 				rwMutex->lock();	// 删缓存是写操作，独占锁
 				auto it = cache_db.find(varName);
@@ -192,6 +209,7 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 		}
 
 		/* 2. 未命中：读盘在磁盘线程任务内完成"读盘 + 过期判定 + 过期直删"，读池任务等待这一轮磁盘 IO */
+		statMiss.fetch_add(1, std::memory_order_relaxed);	// 未命中统计（转入磁盘读取，读回成败均算未命中）
 		auto fut = diskThread->submit([this, varName]() -> std::pair<int, Val> {
 			std::any res;	// 读出的实体（本任务局部变量，不引用调用方栈帧）
 			Val val;		// 读出的时间信息（是否永久/过期时间/更新时间等）
@@ -293,4 +311,16 @@ std::future<int> Cache::reWrite()
 	// 直接交给disk一起处理，降低业务逻辑耦合，更易维护（读写文件，磁盘 IO 任务）
 	// 提交即返回，结果走 future（需要确认重写完成时 get()）
 	return diskThread->submit([this]() { return disk->reWrite(); }, DISK_TASK);
+}
+
+CacheStat Cache::getStat() const
+{
+	// 原子读快照：统计是观测用途的累加值，relaxed 读即可（不追求同一时刻的一致性）
+	return CacheStat{
+		statHit.load(std::memory_order_relaxed),
+		statMiss.load(std::memory_order_relaxed),
+		statEvictCnt.load(std::memory_order_relaxed),
+		statEvictItems.load(std::memory_order_relaxed),
+		statEvictUs.load(std::memory_order_relaxed)
+	};
 }

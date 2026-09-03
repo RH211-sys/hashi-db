@@ -100,6 +100,13 @@ public:
 		返回值：std::future<int>，get() 后取错误码：SUCCESS 成功
 	*/
 	std::future<int> reWrite();
+
+	/*
+		功能：读取缓存运行统计快照（命中/未命中/淘汰计数与耗时，供性能测试与运行观测）
+		参数：无
+		返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
+	*/
+	CacheStat getStat() const;
 };
 
 #endif
