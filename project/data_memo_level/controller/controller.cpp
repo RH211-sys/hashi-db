@@ -14,35 +14,38 @@ Controller::Controller(long long memoSize, long long maxSize, size_t poolThreadN
 	disk->setCache(cache);
 }
 
-int Controller::delData(const std::string& varName)
+std::future<int> Controller::delData(const std::string& varName)
 {
-	return cache->delData(varName).get();	// 同步等待磁盘删除完成
+	// 删除任务已在缓存模块内交写线程执行，直接透传 future，调用方不阻塞
+	return cache->delData(varName);
 }
 
-int Controller::selData(const std::string& varName, std::any& res)
+std::future<SelResult> Controller::selData(const std::string& varName)
 {
-	int resCode;
-	cache->selData(varName, res, resCode);
-	return resCode;
+	// 查询任务已在缓存模块内交读线程池执行，直接透传 future，调用方不阻塞
+	return cache->selData(varName);
 }
 
-int Controller::persisVar(const std::string& varName)
+std::future<int> Controller::persisVar(const std::string& varName)
 {
-	return cache->persisVar(varName).get();
+	// 刷盘任务已在缓存模块内交磁盘线程执行，直接透传 future，调用方不阻塞
+	return cache->persisVar(varName);
 }
 
-int Controller::persisAll()
+std::future<int> Controller::persisAll()
 {
-	return cache->persisVar().get();
+	// 刷盘任务已在缓存模块内交磁盘线程执行，直接透传 future，调用方不阻塞
+	return cache->persisVar();
 }
 
-int Controller::flushDisk()
+std::future<int> Controller::flushDisk()
 {
-	// 磁盘 IO 统一在磁盘线程执行，不占调用线程
-	return diskThread->submit([this]() { return disk->flushDisk(); }, DISK_TASK).get();
+	// 刷盘是磁盘模块方法（清理过期 + 落盘脏数据）：磁盘 IO 统一在磁盘线程执行，调用方不阻塞
+	return diskThread->submit([this]() { return disk->flushDisk(); }, DISK_TASK);
 }
 
-int Controller::reWrite()
+std::future<int> Controller::reWrite()
 {
-	return cache->reWrite().get();
+	// 重写任务已在缓存模块内交磁盘线程执行，直接透传 future，调用方不阻塞
+	return cache->reWrite();
 }

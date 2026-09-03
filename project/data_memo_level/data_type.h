@@ -72,13 +72,13 @@ struct Val {
 	std::chrono::system_clock::time_point expireTime;	// 过期时间
 	std::chrono::system_clock::time_point updateTime;	// 更新时间
 	bool isDirty;										// 脏数据标记（true为脏，false为非脏）
-	std::any entity;									// 值实体
+	std::shared_ptr<std::any> entity;					// 值实体（指针：写入时实体移进堆，命中/回填共享同一实体，零拷贝）
 };
 
-// 查询结果：selData 的 future 返回体，一个 future 带回错误码与查询数据
+// 查询结果：selData 的 future 返回体，一个 future 带回错误码与查询实体
 struct SelResult {
 	int resCode;		// 错误码（SUCCESS 成功 / FIND_FAILED 不存在 / EXPIRED 已过期）
-	std::any data;		// 查询到的实体（失败时为空）
+	std::shared_ptr<std::any> entity;	// 查询到的实体（指针，失败时为空；只读约定，修改请走 modData）
 };
 
 

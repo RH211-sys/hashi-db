@@ -1,94 +1,114 @@
-# MyDB 存储层回忆文档（2026-09-01，压缩上下文后先读此文件）
+- # 实现阶段：需求梳理与待办（草稿，已整理）
 
-## 项目概况
+  > 本文件是本次大重构的决策存档与后续行动清单，据此继续开发，不再依赖对话上下文。
+  > 状态标记：✅ 已拍板并已落地到代码 / 📋 已拍板待落地 / ⬜ 已确认但本次不做（后续项）
 
-- 个人 C++ 数据库项目：Windows + VS2022 + MSVC + CMake + C++20，所有文件 UTF-8
-- 当前阶段：存储层（data_memo_level）功能完成，测试全部 PASS；下阶段按「待办」优化
+  ## 一、总体形态（✅ 已确认）
 
-## 代码结构
+  - 存储引擎全部在后台线程执行，调用方**不阻塞**；所有公开接口（controller / cache / disk / 线程池）返回 `std::future`，上层需要结果时才 `.get()`。
+  - 返回体：有实体数据的查询用 `std::future<SelResult>`，纯操作码的操作用 `std::future<int>`，一组查询将来可能 `std::future<std::vector<SelResult>>`。
+  - 对应关系：
+    - sel → `future<SelResult>`
+    - add / del / mod → `future<int>`
+  - **每个操作只有一条任务链、一个"主场线程"**，任务不嵌套、不混乱；绝对不允许"调用线程阻塞等待整条链"。
 
-- `project/data_memo_level/`
-  - `controller/` — Controller 统一入口（组装 Cache/Disk/DiskThread，同步返回 int）
-  - `cache/` — Cache：缓存 + LRU 淘汰
-  - `disk/` — Disk：持久化（追加写 + 两段式校验码）
-  - `common/` — WritePrefMutex（写优先读写锁）
-  - `controller/taskThreads.h` — ReadPool（读线程池，预留未用）/ WriteThread（预留未用）/ DiskThread（磁盘单线程，双队列差距调度，submit 返回 future）
-  - `data_type.h` — Val 结构 + typeReg 类型注册表 + DEFINE_DATA_TYPE / THE_SIZE 宏
-  - `protocol.h` — 错误码 + 磁盘协议常量
-- `test/memo_test/test1/` — 功能测试工程（memo_test1，VS 可单独启动）
-- main.cpp 已删除；根 CMakeLists 中 myDB 主程序目标已注释（测试期）
+  ## 二、线程职责彻底分工（✅ 已确认）
 
-## 关键设计
+  | 线程                          | 职责                                | 锁                         |
+  | ----------------------------- | ----------------------------------- | -------------------------- |
+  | 读线程池 ReadPool             | 只读缓存资源（命中查询）            | 共享锁 lock_shared，并发读 |
+  | 写线程 WriteThread（单线程）  | 只写缓存资源（新增/修改/删除/回填） | 独占锁 lock，串行写        |
+  | 磁盘线程 DiskThread（单线程） | 只操作磁盘索引 inDisk 与持久化文件  | 无锁（天然串行）           |
 
-### 错误码（protocol.h）
-SUCCESS=200 / KEY_EXIST=201 / FIND_FAILED=202 / TYPE_VALID=203 / EXPIRED=204 / MEMO_OUT=300 / LONG_NAME=301 / UNKNOWN_ERROR=400 / FILE_OPEN_FILED=500
+  - 磁盘线程内分两类任务，`taskGap` 让位调度：**CACHE_TASK（快，微秒级，访问 cache_db 索引）优先**；DISK_TASK（慢，毫秒级，文件 IO）在缓存任务堆积到上界（upEdge=15）时穿插执行，落到下界（lowEdge=-5）时重置。
+  - 允许且仅允许两类"主场线程短暂等待磁盘线程"的跨池等待（用户拍板：可以保留，只要不乱）：
+    1. 写线程上的任务（addData / modData / delData）短暂 `submit + get()` 等磁盘线程的 **CACHE_TASK**（微秒级 inDisk 查询），用于查重/确认存在；
+    2. selData 未命中时，**读线程池任务**等待磁盘线程一次 **DISK_TASK**（读盘）。
+  - 磁盘线程任务内发现问题**直接处理，不再二次提交**（例如读盘后发现已过期：磁盘线程内直接调 disk 删除，不再提交一个删除任务回去）。
+  - 触发淘汰时 delData 自然阻塞：淘汰与写操作同在写线程串行队列里，排在前面的淘汰任务阻塞执行时，后面的 delData 等写线程即可（不需要额外处理）。
 
-### 磁盘记录布局
-`[校验码 1B][实体大小 4B][更新时间 8B(微秒)][过期时间 8B(微秒,永久写0)][是否永久 1B][类型名 32B][变量名 32B][实体 dataSize]`，头部固定 86B
-- **追加写**：旧记录留空洞，inDisk 指向最新偏移，reWrite 回收空洞
-- **两段式写**：先写 CHECK_BROKEN 整条，写完回写 CHECK_VALID（写一半崩溃 → 重建截断）
-- 类型名必须落盘：std::any 类型擦除，读盘靠 typeName 查注册表反序列化
+  ## 三、淘汰算法：删除 LRU 链表，改全局采样（✅ 已确认）
 
-### 缓存与 LRU
-- Cache：`unordered_map<string, Val> cache_db` + WritePrefMutex + LRU 哈希链表（哨兵 start/end，头=最近，尾=最久）
-- Val：typeName / dataSize / isPermanent / expireTime / updateTime / isDirty / entity(std::any)
-- **LRU_out**：目标 curSize < 0.9×memoSize；先删过期（缓存 + inDisk 索引，防复活），再尾部采样 15 个算分入大顶堆 `priority_queue<pair<double,string>>`
-- **分数 = 时间档位×30 + ln(dataSize)**；五档 <1min/<1h/<1d/<7d/≥7d，档距 30 > ln(memoSize) 上限
-- 脏数据淘汰：锁内 `val = std::move(it->second)` 移动出迭代器 → 删链表/缓存/curSize → 锁外提交 `disk->persisData(victim, val)`（带 Val 版，DISK_TASK，提交即返回不等待）
-- 所有增长点（插入/回填/改大）锁外 `if (curSize > memoSize) LRU_out()`
+  ### 动机
 
-### 接口语义（Controller 同步返回 int）
-- **addData**：缓存或磁盘已有 → KEY_EXIST；**不主动刷盘**（落盘靠淘汰/flushDisk/persisAll）
-- **selData**：命中缓存先检查过期（过期 → 删缓存+链表+curSize+提交磁盘删除任务 → EXPIRED）；未命中走磁盘，回填前锁外检查过期（过期 → 提交磁盘删除 → EXPIRED）；回填后超限触发 LRU_out
-- **modData**：命中替换标脏；未命中查磁盘存在则回填标脏（不主动刷盘）
-- **delData**：缓存命中删除即算成功，磁盘无记录（从未落盘）不算失败；缓存磁盘都没有 → FIND_FAILED
-- **persisVar（无 Val 版）**：从缓存取数据，**缓存没有 → FIND_FAILED**（被淘汰的数据无法 persisVar）
-- **persisAll**：收集缓存中未过期脏数据批量写；**flushDisk**：删缓存中过期数据 + 刷全部脏数据
-- **reWrite**：整理所有数据到文件前部 + resize_file 截断回收空洞；原地重写，崩溃=数据全损交运维（概率极小，双文件方案大材小用）
+  - 原 LRU 链表 + 命中刷新 updateTime：**每次读命中都要取读写锁写链表**，读路径被"必须写"卡住性能天花板。
+  - 现改为：**命中路径纯读零写**——读命中只做共享锁 + 拷贝实体指针，不刷新链表、不刷新任何时间/顺序信息、不提交任何写任务。
 
-### 设计结论（原 draft 摘要，勿推翻）
-- isDirty 先清后写：写文件前锁内清脏，写失败置回，防写文件期间新修改被误清
-- 删除 = 纯内存 inDisk.erase，不落文件标记；崩溃后已删数据复活可容忍
-- MVCC 不采用（锁临界区微秒级，瓶颈在磁盘 IO；多版本内存翻倍）
-- 不用字节缓冲方案（数据存两份内存翻倍）
-- 批量持久化：一次文件开关写多条
+  ### 决策点
 
-### 线程
-- DiskThread：单线程双队列（cacheTasks 快 / diskTasks 慢），差距调度（缓存优先，taskGap 到 upEdge=15 让位磁盘一个任务）；submit 返回 future，get() 阻塞；析构处理完队列后 join
-- Cache 持 Disk/DiskThread 的 shared_ptr（注入），Controller 也持 shared_ptr 共享所有权
+  1. **删除 LRU 链表**：ListNode 结构、LRU_hash、start/end、LRU_addNode / LRU_moveToHead / LRU_removeNode 全部删除；函数改名 `LRU_out → evict`、`LRU_score → evictScore`。
+  2. **updateTime 语义**：只在写操作/回填等写路径上更新，读命中不再刷新（放弃"越热 updateTime 越新"的时效性，接受一小部分命中率损失，换性能上限与复杂度下降）。
+  3. **全局采样，不遍历整个缓存**：在 cache_db 内随机取样本（样本数沿用 15），算分公式不变（时间档位 × 档距 + ln(大小)，分数越高越优先淘汰）；分数基于"距上次**写入**的时间档位"。
+  4. **优先队列 + 不每轮重采样**：采样算分后入大顶堆 `priority_queue`，每轮淘汰 pop 分数最高者；堆空才补采样。**锁粒度问题的解法**：不用跨轮大锁——每轮删除前在独占锁内 `find` 重新校验（是否已被删/是否过期/脏与干净以当时为准），校验通过才动手；干净的直接删，脏的锁内拷贝出 `shared_ptr`（轻量）后**锁外**提交 DISK_TASK persisData 刷盘，过期条目顺手删并批量提交 CACHE_TASK 删 inDisk；一轮结束后如容量仍不达标继续（不再重采样）。
+  5. **淘汰在写线程内串行、阻塞执行**，循环直到 `curSize ≤ memoSize × 9/10` 才返回。
+  6. 触发点：addData / modData / 回填路径在写线程内、锁外调用 evict（防刚插入就超限）。
+  7. **竞态修正（用户明确要求）**：触发淘汰前比较 `curSize > memoSize` 时，**必须在解锁前先把 curSize 拷贝到局部变量，解锁后用拷贝值比较**（锁外读 curSize 有竞态；锁内拷贝开销极小）。
 
-### 类型注册
-- `DEFINE_DATA_TYPE(name)`：totalType.insert + typeReg.emplace（序列化/反序列化函数），**必须在函数作用域内调用**（全局作用域 MSVC 解析为声明报 C3927）
-- 用户类型必须实现：静态 getClassName / 模板 serialize / 静态 theSize
+  ## 四、零拷贝：实体指针化（✅ 已确认）
 
-## 测试
+  - `Val.entity` 与 `SelResult.entity` 都是 `std::shared_ptr<std::any>`。
+  - 锁内**只复制指针，不复制实体**；写入/回填时实体 `std::make_shared` 移进堆，一次移动不拷贝。
+  - 命中 / 回填 / 返回结果共享**同一实体指针**（上层只读约定，要修改请走 modData）。
+  - 缓存删除条目只减引用计数，上层手里的指针不会悬空（shared_ptr 保活）。
 
-- 结构：根 CMakeLists `add_subdirectory(test)` → test/CMakeLists.txt → test/memo_test/CMakeLists.txt（自动收集子测试目录 + STORAGE_SOURCES 共享 project/*.cpp，排除 third_party）→ 子测试各自 add_executable
-- test1 功能测试（全 PASS）：增/查/改/删/过期/LRU 淘汰回填/修改后淘汰落盘/persisVar/persisAll/flushDisk/reWrite
-- 运行：VS 启动 memo_test1；断言输出 [PASS]/[FAIL] 并计数，失败返回码 1
-- cout 输出用英文（VS 控制台编码问题）；数据文件 test1_data.dat 测试后删除
-- 测试配置：缓存 64KB（触发 LRU），磁盘 64MB
+  ## 五、接口流程细节（✅ 已确认，实现时逐条对照）
 
-## 本轮修复的 Bug（已修复）
+  ### addData（主场：写线程）→ future<int>
 
-1. **reWrite 死锁**：writeCacheData 缓存未命中分支直接 return 未 unlock_shared → 读锁泄漏，后续写锁永久等待 → 先解锁再返回
-2. **delData 语义**：缓存命中删除成功，磁盘无记录不算失败
-3. **selData 命中路径无过期检查**：命中已过期数据返回 SUCCESS → 加过期检查（删缓存+链表+curSize+提交磁盘删除+EXPIRED）
+  1. **共享锁**（lock_shared）探测缓存：已存在 → 返回 KEY_EXIST；
+  2. 向磁盘线程提交 `containsVar`（CACHE_TASK）并 `get()` 同步等待：磁盘已存在 → 返回 KEY_EXIST（不允许重复新增）；
+  3. **锁外**构造 Val：`THE_SIZE` 在移动实体前计算；`v.entity = make_shared(move(entity))`；
+  4. **独占锁**（lock）：锁内重新校验 `!contains` 后 `emplace(move(v))`，`curSize += dataSize`；锁内拷贝一份当前大小到局部变量再解锁；
+  5. 解锁后若局部变量 > memoSize 触发 evict；返回 SUCCESS。
 
-## 待办（下阶段，按用户要求）
+  ### modData（主场：写线程）→ future<int>
 
-1. **磁盘模块持久化代码组织**：封装序列化/反序列化接口，把 persisData 三个重载 + reWrite writeCacheData 重复的「检查→序列化→写记录→更新 inDisk/curSize」流程统一封装
-2. **调用读线程池读缓存（lock_shared）**：ReadPool 已实现未启用，读任务走读线程池并发
-3. **拷贝改移动，零拷贝**：C++ 语法特性优化热点路径（如 selData `res = it->second.entity`、Val 传递、批量 vector 收集）
-4. **磁盘线程挂后台，controller 异步化**：调用立即返回，查返回码时再阻塞；该异步的异步，不要同步——controller 同步缓存后同步调用磁盘是性能问题，controller 应返回 future
+  1. **锁外**算好 `newSize = THE_SIZE(...)` 与 `newEntity = make_shared(move(entity))`（锁内只做记账与指针交换，临界区短）；
+  2. **独占锁**内 find：命中 → `curSize = curSize - 旧size + newSize`、替换实体指针、updateTime = now、isDirty = true；锁内拷贝大小后解锁，超限触发 evict，返回 SUCCESS；
+  3. 未命中 → 磁盘 `containsVar`（CACHE_TASK）等待：磁盘也没有 → 返回 FIND_FAILED；
+  4. 磁盘存在 → 锁外构造 Val（isPermanent = true、isDirty = true、entity 用第 1 步同一实体指针）→ **独占锁**回填（锁内重校验防止并发插入），超限触发 evict。
 
-## 未实现
+  ### selData（主场：读线程池）→ future<SelResult>
 
-- 启动时从数据文件扫描恢复 inDisk 索引（重建）：交给管理层，磁盘模块不做
+  1. 共享锁查缓存：
+     - **命中且未过期** → 拷贝实体指针（纯读零写，无任何写任务/刷新），返回 SUCCESS + 同一实体指针；
+     - **命中但已过期** → 只提交清理任务不等待（两条**平级** push：写线程删缓存条目 + 磁盘线程 CACHE_TASK 删 inDisk），返回 EXPIRED；
+  2. **未命中** → 提交磁盘线程任务（读池任务 `get()` 等待这一次读盘）：磁盘线程内完成"读盘 → 过期判定 → **过期直接删除**（已在磁盘线程，不二次提交）"；读出的 Val 回填**交写线程后台处理**（push 不等待；任务参数捕获含 shared_ptr 的 Val 保活实体，锁内重校验 contains 跳过则返回）；返回 SUCCESS + 同一实体指针；
+  3. 磁盘也没有 → 返回 FIND_FAILED。
 
-## 用户工作偏好（重要）
+  ### delData（主场：写线程）→ future<int>
 
-- 只写用户要求的代码；不要动用户的注释
-- 有问题先提问，不要猜测，不要乱想
-- 回答简洁；讨论确认后再写代码
-- 忽略 clangd 报错（用户用 MSVC；clangd 因 cereal include 路径未配置级联报错）
+  - 独占锁删缓存条目 → 磁盘线程 CACHE_TASK 删 inDisk/文件 → 修正错误码返回。
+
+  ### 磁盘线程主场操作
+
+  - persisVar / persisAll / reWrite / flushDisk 等纯盘操作全部走 DiskThread，接口同步返回 future（当前已如此，保留）。
+
+  ### Controller（上层）
+
+  - 8 个 API 全部**透传** cache / diskThread 的 future，去掉现有同步 `.get()`；模板透传 addData / modData；头注释"CRUD 与持久化 API 全部同步返回错误码"及 readPool / writeThread 成员注释"暂未启用，预留"均已过时，随签名同步更新。
+
+  ## 六、待办清单（按执行顺序）
+
+  1. ✅ **data_type.h**：Val.entity 与 SelResult.entity → shared_ptr<std::any>（已完成）。
+  2. ✅ **cache.h**：删除 ListNode / LRU_hash / start / end 与三个链表函数声明；evictScore / evict 命名与注释（全局采样语义，无任何 LRU 链表残留表述）；addData / modData 模板 → future<int>（共享锁探测 → 磁盘等待 → 独占锁插入，锁内快照 curSize 锁外比较）；selData → future<SelResult>（块注释说明命中零写 / 过期清理 / 磁盘线程读 + 过期直删 / 后台回填）；delData / persisVar×2 / reWrite 声明保持（delData 注释行保留原文"提交即返回，不阻塞；需要准确结果时对返回的 future 调用 get()"）；member 版 modData 重载声明保留。
+  3. ⬜ **cache.cpp 重写**（下一步）：
+     - evict 全局采样实现（随机桶/随机样本 15 → 算分 → 大顶堆 → 逐条独占锁 find 重校验删除；脏拷出锁外 DISK_TASK 刷盘；过期顺手删 + 批量 CACHE_TASK 删 inDisk；循环至 curSize ≤ memoSize×9/10；写线程内阻塞执行）；
+     - selData 新实现（未来链：命中纯读 / 过期双平级 push / miss 磁盘任务内读 + 过期直删 / 回填 push 写线程）；
+     - delData 整链写线程；
+     - 删除全部 LRU 链表函数与构造函数里 start/end 初始化；
+     - 命名 evict / evictScore，注释按"全局采样、无 LRU 链表"措辞。
+  4. ⬜ **disk.cpp / disk.h**：接口签名零改动，适配 4 处序列化调用 `reg->second.first(val.entity)` → `reg->second.first(*val.entity)`（persisData ×2、批量 writeOne、reWrite writeCacheData）；disk 侧 selData 不填 val.entity，由缓存侧任务 make_shared 包装。
+  5. ⬜ **controller.h / .cpp**：8 API 透传 future + 同步更新注释（含头注释与过时成员注释）。
+  6. ⬜ 编译测试：测试模块调用点补 `.get()`，由用户编译并跑功能性测试。
+
+  ## 七、本次不做（后续项，已确认以后处理）
+
+  - **过期数据定时清理接口**：功能目前完全没有，接口形态待设计（上层定时调度）。
+  - **flushDisk / reWrite 删过期条目与 curSize / 统计不同步 bug**：磁盘模块遍历删缓存过期条目时没有同步减 curSize，已知 bug，以后修。
+  - **批量持久化**：缓存达到阈值后应持久化一批而非单个。
+  - **member 版 modData**（`modData(varName, member, entity, resCode)`，用于改某个字段）未实现。
+  - **磁盘模块代码优化**：序列化封装、代码组织、去冗余。
+  - **原地重写**：磁盘重写直接在一个文件上原地覆盖（先读旧文件，顺序找正常数据，每次读一块内存大小，校验后从头顺序往下写覆盖），不用新文件；不用删除码是因为允许服务器异常重启/崩溃时回溯。
+  - **文档整理**：修改算法设计的文档，分三个区块（最优 / 维度拓展 / 本次适应）并用 AI 重新比较。
+  - **语法特性优化**：测试模块构建编写 + 用语法特性优化性能（零拷贝移动、返回指针等已部分落地，继续排查仍拷贝处）。

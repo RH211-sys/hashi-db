@@ -10,19 +10,12 @@
 #include <unordered_map>
 #include <cmath>	// 用于计算ln
 
-/* 
+/*
 	宏接口：用于调用该类型的静态成员函数，计算对象大小
 	参数：type数据类型，name对象名
 */
 #define THE_SIZE(type, name) type::theSize(name)   // 用作表达式
 
-struct ListNode {
-	std::string key;	// 变量名
-	ListNode* pre;
-	ListNode* next;
-	ListNode() : key(), pre(nullptr), next(nullptr) {}
-	ListNode(std::string _key) : key(_key), pre(nullptr), next(nullptr) {};
-};
 class Disk;
 
 class Cache {
@@ -36,18 +29,11 @@ private:
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
 	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
-	std::unordered_map<std::string, ListNode*> LRU_hash;	// LRU算法中动态维护的链表
-	ListNode* start;
-	ListNode* end;
 private:
-	// 淘汰算法中的分数计算
-	double LRU_score(Val& val);
-	// 淘汰算法具体实现
-	void LRU_out();
-	// LRU 链表维护（头 = 最近使用，尾 = 最久未用；均在写锁内调用）
-	void LRU_addNode(const std::string& varName);		// 新增：头插
-	void LRU_moveToHead(const std::string& varName);	// 命中：摘除后头插
-	void LRU_removeNode(const std::string& varName);	// 删除：摘除并释放
+	// 淘汰分数计算：距上次写入的时间档位 × 档距 + ln(大小)，分数越高越优先淘汰
+	double evictScore(Val& val);
+	// 全局采样淘汰（无 LRU 链表）：随机桶采样(unordered_map的桶) + 优先队列，阻塞执行到容量达标（写线程内调用）
+	void evict();
 public:
 	Cache(const long long memoSize, const int batchSize = 4, const int upDisEdge = 10, const int minDisEdge = -3);
 
@@ -56,17 +42,35 @@ public:
 	*/
 	void bind(std::shared_ptr<DiskThread> diskThread, std::shared_ptr<Disk> d, std::shared_ptr<ReadPool> readPool, std::shared_ptr<WriteThread> writeThread);
 
-	
-
-	/*  功能：新增数据，
-		参数：变量名，值实体，是否永久，数据持续时间（过期时间 = 更新时间 + 持续时间）
-		resCode：操作码（eg：200，表示操作成功）
+	/*
+		功能：新增一条数据（写任务在写线程串行执行：共享锁探测缓存 → 磁盘索引查重 → 独占锁插入）
+		参数：varName：变量名
+		      entity：值实体（类型 T 需实现 getClassName / serialize / theSize）
+		      isPermanent：是否永不过期
+		      during：数据持续时间（isPermanent 为 false 时生效，过期时间 = 更新时间 + during）
+		返回值：std::future<int>，get() 后取错误码：SUCCESS 成功 / KEY_EXIST 变量已存在
 	*/
 	template <typename T>
-	void addData(const std::string& varName, T entity, bool isPermanent, std::chrono::system_clock::duration during, int& resCode) {
-		// 写任务交给写线程串行执行（构造 Val/锁内检查/插入），与读线程池并发读互斥；本调用同步等待结果
-		writeThread->submit([this, varName, entity = std::move(entity), isPermanent, during, &resCode]() {
-			// 写线程内构造 Val
+	std::future<int> addData(const std::string& varName, T entity, bool isPermanent, std::chrono::system_clock::duration during) {
+		// 写任务交给写线程串行执行，future 直接返回上层，由上层 get() 取错误码
+		return writeThread->submit([this, varName, entity = std::move(entity), isPermanent, during]() mutable -> int {
+			// 1. 共享锁探测缓存（读探测不阻塞并发读）：已存在则冲突
+			{
+				rwMutex->lock_shared();
+				bool exists = cache_db.contains(varName);
+				rwMutex->unlock_shared();
+				if (exists) return KEY_EXIST;
+			}
+
+			// 2. 磁盘索引查重（走磁盘线程快速任务，微秒级）：磁盘已有同样算冲突，不允许重复新增
+			{
+				std::future<bool> fut = diskThread->submit([this, varName]() {
+					return disk->containsVar(varName);
+				}, CACHE_TASK);
+				if (fut.get()) return KEY_EXIST;	// 磁盘已存在该数据
+			}
+
+			// 3. 锁外构造 Val（实体移进堆，零拷贝）
 			Val v;
 			v.typeName = T::getClassName();	// 类型名称
 			v.isPermanent = isPermanent;	// 是否永不过期
@@ -76,104 +80,111 @@ public:
 			}
 			v.isDirty = true;				// 新数据标记为脏，等待刷盘
 			v.dataSize = THE_SIZE(T, entity);	// 数据大小（用户自定义 theSize 计算）
-			v.entity = std::move(entity);		// 移动实体，避免拷贝
+			v.entity = std::make_shared<std::any>(std::move(entity));	// 实体移动进堆，避免拷贝
 
-			// 锁内只做"检查"，锁的粒度最小：缓存已有则冲突
-			rwMutex->lock();
-			if (cache_db.contains(varName)) {
+			// 4. 独占锁插入（锁内重新校验 key：等待期间可能已有并发插入）；锁内拷贝当前大小供锁外比较
+			long long sizeNow = 0;
+			{
+				rwMutex->lock();
+				if (!cache_db.contains(varName)) {
+					cache_db.emplace(varName, std::move(v));	// 移动语义，避免拷贝
+					curSize += v.dataSize;			// 更新缓存当前大小
+				}
+				sizeNow = curSize;	// 锁内快照：解锁后读它判断是否触发淘汰，避免锁外读竞态
 				rwMutex->unlock();
-				resCode = KEY_EXIST;
-				return;
-			}
-			rwMutex->unlock();
-
-			// 缓存没有：查磁盘是否已存在（走磁盘线程查 inDisk 内存索引，微秒级）
-			// 磁盘已有同样算冲突，不允许重复新增
-			std::future<bool> fut = diskThread->submit([this, varName]() {
-				return disk->containsVar(varName);
-			}, CACHE_TASK);
-			if (fut.get()) {
-				resCode = KEY_EXIST;	// 磁盘已存在该数据
-				return;
 			}
 
-			// 校验通过：重新加锁插入（并发期间可能已有其他线程插入，需重新校验 key）
-			rwMutex->lock();
-			if (!cache_db.contains(varName)) {
-				cache_db.emplace(varName, std::move(v));	// 移动语义，避免拷贝
-				LRU_addNode(varName);			// 新数据头插（最近使用）
-				curSize += v.dataSize;			// 更新缓存当前大小
-			}
-			rwMutex->unlock();
-			resCode = SUCCESS;
-			// 超过设定容量：锁外触发淘汰（防刚插入就超限）
-			if (curSize > memoSize) LRU_out();
-		}).get();	// 同步等待写任务完成
+			// 5. 超过设定容量：锁外触发淘汰（全局采样，写线程内阻塞执行，防刚插入就超限）
+			if (sizeNow > memoSize) evict();
+			return SUCCESS;
+		});
 	}
 
-	// 删除数据：提交即返回，不阻塞；需要准确结果时对返回的 future 调用 get()
+	/*
+		功能：删除某变量（缓存删除 + 磁盘索引删除，整链在写线程执行）
+		参数：varName：变量名
+		返回值：std::future<int>，get() 后取错误码：SUCCESS 成功 / FIND_FAILED 变量不存在
+	*/
 	std::future<int> delData(const std::string& varName);
 
-	// 修改某个变量，整体修改
+	/*
+		功能：整体修改某变量（写任务在写线程串行执行：独占锁内命中即替换；未命中查磁盘索引，存在则回填标脏）
+		参数：varName：变量名
+		      entity：新的值实体（类型 T 需实现 getClassName / serialize / theSize）
+		返回值：std::future<int>，get() 后取错误码：SUCCESS 成功 / FIND_FAILED 变量不存在
+	*/
 	template <typename T>
-	void modData(const std::string& varName, T entity, int& resCode) {
-		// 写任务交给写线程串行执行（锁内查 + 替换/回填），与读线程池并发读互斥；本调用同步等待结果
-		writeThread->submit([this, varName, entity = std::move(entity), &resCode]() {
-			// 锁内只做"查 + 替换"
-			rwMutex->lock();
-			auto it = cache_db.find(varName);
-			if (it != cache_db.end()) {
-				long long newSize = THE_SIZE(T, entity);	// 新实体大小
-				curSize = curSize - it->second.dataSize + newSize;	// 先减旧再加新
-				it->second.entity = std::move(entity);	// 命中：替换实体值
-				it->second.dataSize = newSize;
-				it->second.updateTime = std::chrono::system_clock::now();	// 更新时间
-				it->second.isDirty = true;	// 标记为脏数据，等待刷盘
-				LRU_moveToHead(varName);	// 命中刷新：移到链表头（最近使用）
+	std::future<int> modData(const std::string& varName, T entity) {
+		// 写任务交给写线程串行执行，future 直接返回上层，由上层 get() 取错误码
+		return writeThread->submit([this, varName, entity = std::move(entity)]() mutable -> int {
+			// 锁外算好新实体大小与实体指针（锁内只做记账与指针交换，临界区短）
+			long long newSize = THE_SIZE(T, entity);	// 新实体大小
+			auto newEntity = std::make_shared<std::any>(std::move(entity));	// 实体移进堆一次
+
+			// 1. 独占锁内查缓存：命中即替换（替换 shared_ptr 指针，不碰实体内容）
+			{
+				rwMutex->lock();
+				auto it = cache_db.find(varName);
+				if (it != cache_db.end()) {
+					curSize = curSize - it->second.dataSize + newSize;	// 先减旧再加新
+					it->second.entity = newEntity;	// 命中：替换实体指针（零拷贝）
+					it->second.dataSize = newSize;
+					it->second.updateTime = std::chrono::system_clock::now();	// 更新时间
+					it->second.isDirty = true;	// 标记为脏数据，等待刷盘
+					long long sizeNow = curSize;	// 锁内快照：解锁后判断是否触发淘汰
+					rwMutex->unlock();
+					// 实体变大可能超限：锁外触发淘汰
+					if (sizeNow > memoSize) evict();
+					return SUCCESS;
+				}
 				rwMutex->unlock();
-				resCode = SUCCESS;
-				// 实体变大可能超限：锁外触发淘汰
-				if (curSize > memoSize) LRU_out();
-				return;
-			}
-			rwMutex->unlock();
-			// 缓存未命中：查磁盘是否存在（inDisk 有且未删 → 允许新增缓存标脏，刷盘时更新磁盘）
-			// 走磁盘线程查 inDisk（内存索引，微秒级），避免缓存线程直接访问磁盘状态
-			std::future<bool> fut = diskThread->submit([this, varName]() {
-				return disk->containsVar(varName);
-			}, CACHE_TASK);	// 查 inDisk 内存索引，缓存任务
-			if (!fut.get()) {
-				resCode = FIND_FAILED;	// 磁盘也没有，无法修改
-				return;
 			}
 
-			// 校验通过：新增缓存并标脏（重新校验 key，防止并发已插入），锁前构造val
+			// 2. 缓存未命中：查磁盘索引（inDisk 有且未删 → 允许回填缓存标脏，刷盘时更新磁盘）
+			{
+				std::future<bool> fut = diskThread->submit([this, varName]() {
+					return disk->containsVar(varName);
+				}, CACHE_TASK);	// 查 inDisk 内存索引，缓存任务
+				if (!fut.get()) return FIND_FAILED;	// 磁盘也没有，无法修改
+			}
+
+			// 3. 磁盘存在：锁外构造 Val（磁盘数据不存过期信息，默认永久），独占锁内回填
 			Val v;
 			v.typeName = T::getClassName();
 			v.isPermanent = true;	// 磁盘数据不存过期信息，默认永久
 			v.updateTime = std::chrono::system_clock::now();
 			v.isDirty = true;		// 脏数据，等待刷盘更新磁盘
-			v.dataSize = THE_SIZE(T, entity);	// 数据大小
-			v.entity = std::move(entity);		// 移动实体，避免拷贝
-			rwMutex->lock();
-			if (!cache_db.contains(varName)) {
-				cache_db.emplace(varName, std::move(v));
-				LRU_addNode(varName);			// 新数据头插（最近使用）
-				curSize += v.dataSize;			// 更新缓存当前大小
+			v.dataSize = newSize;	// 数据大小
+			v.entity = newEntity;	// 与本次修改同一实体指针
+			long long sizeNow = 0;
+			{
+				rwMutex->lock();
+				if (!cache_db.contains(varName)) {	// 锁内重校验：等待期间可能已并发插入
+					cache_db.emplace(varName, std::move(v));
+					curSize += v.dataSize;			// 更新缓存当前大小
+				}
+				sizeNow = curSize;	// 锁内快照：解锁后判断是否触发淘汰
+				rwMutex->unlock();
 			}
-			rwMutex->unlock();
-			resCode = SUCCESS;
 			// 回填会增大缓存：超限触发淘汰
-			if (curSize > memoSize) LRU_out();
-		}).get();	// 同步等待写任务完成
+			if (sizeNow > memoSize) evict();
+			return SUCCESS;
+		});
 	}
 
 	// 用于修改某个变量的某个属性
 	template <typename T>
 	void modData(const std::string& varName, std::string& member, const T& entity, int& resCode);
 
-	// 查找，结果写入 res
-	void selData(const std::string& varName, std::any& res, int& resCode);
+	/*
+		功能：查询某变量（异步，提交即返回；命中缓存直接返回实体指针；未命中走磁盘读取并回填缓存；过期数据舍弃并提交磁盘删除）
+		参数：varName：变量名
+		返回值：std::future<SelResult>，get() 后取 resCode（SUCCESS 成功 / FIND_FAILED 不存在 / EXPIRED 已过期）
+		       与 entity（实体指针：与缓存共享同一实体，零拷贝；失败时为空）
+		说明：查询链在读线程池执行（读锁并发查询，命中纯读零写）；命中过期只提交清理任务不等待；
+		      未命中在磁盘线程内完成"读盘 + 过期判定 + 过期直删"，回填交写线程后台处理（实体指针保活）
+	*/
+	std::future<SelResult> selData(const std::string& varName);
 
 	// 单个变量持久化：提交即返回，不阻塞，结果走 future
 	std::future<int> persisVar(const std::string& varName);
@@ -186,4 +197,3 @@ public:
 };
 
 #endif // !_CACHE_H_
-

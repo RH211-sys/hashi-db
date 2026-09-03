@@ -81,7 +81,7 @@ int Disk::persisData(const std::string& varName)
 
     /* ========== 序列化 =========== */
 
-    std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
+    std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
     int dataSize = (int)bytes.size();			// 数据大小：只含实体
     int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
@@ -176,7 +176,7 @@ int Disk::persisData(const std::string& varName, const Val& val)
 
     /* ========== 序列化 =========== */
 
-    std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
+    std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
     int dataSize = (int)bytes.size();			// 数据大小：只含实体
     int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
@@ -278,7 +278,7 @@ int Disk::persisData(std::vector<std::string> varNameSet)
         if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
         /* ========== 序列化 =========== */
-        std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
+        std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
         int dataSize = (int)bytes.size();			// 数据大小：只含实体
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
@@ -609,7 +609,7 @@ int Disk::reWrite()
         if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
         /* ========== 序列化 =========== */
-        std::vector<char> bytes = reg->second.first(val.entity);	// 实体序列化字节
+        std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
         int dataSize = (int)bytes.size();
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;
 
