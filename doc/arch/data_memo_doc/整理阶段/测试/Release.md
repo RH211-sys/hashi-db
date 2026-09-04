@@ -98,3 +98,65 @@
 ```
 
 第三轮
+
+```
+================== START (performance benchmark) ==================
+[prewarm [1] QPS - read-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [1] QPS - read-only (duration 30s) =====
+  requests: 29050266 | QPS 968342
+  latency(us): mean 8 | P50 6 | P99 34 | P999 126
+  cache: hit 29050266 / miss 0 -> hit rate 100%
+  evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+[prewarm [2] QPS - read70/write30] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read70/write30 (duration 30s) =====
+  requests: 831308 | QPS 27710
+  latency(us): mean 288 | P50 10 | P99 5256 | P999 38496
+  cache: hit 540535 / miss 41932 -> hit rate 92.801%
+  evict: 1071 calls / 22497 items / avg 0.158085 ms per call / evict-ratio 0.564363%
+[prewarm [3] QPS - write-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [3] QPS - write-only (duration 30s) =====
+  requests: 113870 | QPS 3795
+  latency(us): mean 2108 | P50 34 | P99 47938 | P999 88841
+  cache: hit 0 / miss 0 -> hit rate 0%
+  evict: 1452 calls / 17094 items / avg 0.0601687 ms per call / evict-ratio 0.291217%
+[prewarm hit-rate 2x] 1015 keys, 200 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 2x (total 200 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 1213990 | QPS 40466
+  latency(us): mean 197 | P50 9 | P99 3651 | P999 6145
+  cache: hit 1082986 / miss 131004 -> hit rate 89.2088%
+  evict: 2979 calls / 129391 items / avg 0.232345 ms per call / evict-ratio 2.30719%
+[prewarm hit-rate 3x] 1560 keys, 300 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 3x (total 300 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 956270 | QPS 31875
+  latency(us): mean 250 | P50 9 | P99 3646 | P999 12636
+  cache: hit 806730 / miss 149540 -> hit rate 84.3622%
+  evict: 3070 calls / 149478 items / avg 0.228177 ms per call / evict-ratio 2.33501%
+[prewarm hit-rate 4x] 2084 keys, 400 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 4x (total 400 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 496259 | QPS 16541
+  latency(us): mean 483 | P50 9 | P99 8831 | P999 12875
+  cache: hit 390380 / miss 105879 -> hit rate 78.6646%
+  evict: 2541 calls / 106370 items / avg 0.297564 ms per call / evict-ratio 2.52036%
+================== END, total 182s ==================
+```
+
+## 读8写2业务
+
+```
+================== START (performance benchmark) ==================
+[prewarm [2] QPS - read80/write20] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read80/write20 (duration 30s) =====
+  requests: 1065308 | QPS 35510
+  latency(us): mean 225 | P50 8 | P99 4091 | P999 35585
+  cache: hit 789920 / miss 62920 -> hit rate 92.6223%
+  evict: 1060 calls / 21667 items / avg 0.21232 ms per call / evict-ratio 0.750197%
+================== END, total 30s ==================
+```
+
