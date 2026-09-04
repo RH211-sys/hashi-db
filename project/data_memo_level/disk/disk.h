@@ -3,6 +3,7 @@
 #define _DISK_H_
 
 #include "../data_type.h"
+#include <utility>
 #include <vector>
 #include <list>
 #include <unordered_map>
@@ -37,6 +38,8 @@ public:
 	int persisData(const std::string& varName);
 	// 持久化某变量（带数据版：数据由调用方提供，不查缓存，供淘汰刷盘用）
 	int persisData(const std::string& varName, const Val& val);
+	// 持久化变量集（带数据批量版：一次文件开关写整批，数据由调用方提供，供淘汰攒批刷盘用）
+	int persisData(std::vector<std::pair<std::string, Val>> dataSet);
 	// 持久化某变量集
 	int persisData(std::vector<std::string> varNameSet);
 	// 持久化某个数据

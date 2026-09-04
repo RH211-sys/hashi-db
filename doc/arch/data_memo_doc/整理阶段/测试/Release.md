@@ -240,3 +240,45 @@ D:\Work\project\personal_project\C++\myDB\out\build\x64-Release\test\memo_test\C
 ================== END, total 30s ==================
 ```
 
+优化异步后：
+
+```
+================== START (performance benchmark) ==================
+[prewarm [2] QPS - read70/write30] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read70/write30 (duration 30s) =====
+  requests: 37334 | QPS 1244
+  latency(us): mean 6436 | P50 21 | P99 194500 | P999 431473
+  cache: hit 22782 / miss 3573 -> hit rate 86.4428%
+  evict: 206 calls / 5302 items / avg 0.547218 ms per call / evict-ratio 0.375757%
+================== END, total 30s ==================
+```
+
+优化IO后（淘汰中批量写入）
+
+```
+================== START (performance benchmark) ==================
+[prewarm [1] QPS - read-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [1] QPS - read-only (duration 30s) =====
+  requests: 16846539 | QPS 561551
+  latency(us): mean 14 | P50 9 | P99 75 | P999 309
+  cache: hit 16846539 / miss 0 -> hit rate 100%
+  evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+[prewarm [2] QPS - read70/write30] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read70/write30 (duration 30s) =====
+  requests: 537195 | QPS 17906
+  latency(us): mean 446 | P50 11 | P99 15555 | P999 49264
+  cache: hit 328192 / miss 48138 -> hit rate 87.2086%
+  evict: 967 calls / 24745 items / avg 0.13455 ms per call / evict-ratio 0.4337%
+[prewarm [3] QPS - write-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [3] QPS - write-only (duration 30s) =====
+  requests: 255417 | QPS 8513
+  latency(us): mean 940 | P50 27 | P99 23549 | P999 56246
+  cache: hit 0 / miss 0 -> hit rate 0%
+  evict: 1241 calls / 31160 items / avg 0.0408719 ms per call / evict-ratio 0.169073%
+================== END, total 91s ==================
+```
+

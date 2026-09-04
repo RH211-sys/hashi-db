@@ -58,6 +58,9 @@ void Cache::evict()
 			std::memory_order_relaxed);
 	};
 
+	// 脏数据攒批桶：采样淘汰循环中只收集（Val 拷贝已带出锁），淘汰结束统一组写入落盘（一次文件开关写整批）
+	std::vector<std::pair<std::string, Val>> flushBatch;
+
 	// 1. 先批量删过期数据（独占锁内全遍历：先清过期垃圾，避免把活数据误淘汰）
 	//    全遍历只在写线程的淘汰路径发生（低频、阻塞任务），不在读路径上
 	//    inDisk 索引一次批量删（磁盘集合删除接口），防过期数据从磁盘复活
@@ -146,15 +149,19 @@ void Cache::evict()
 			sizeNow = curSize;	// 锁内快照：解锁后循环条件用它，避免锁外读竞态
 			rwMutex->unlock();
 		}
-		/* 
-			若干净数据已删除，则处理下一个候选 
-			否则是脏数据：提交刷盘任务，提交即返回，不等待
+		/*
+			若干净数据已删除，则处理下一个候选
+			否则是脏数据：Val 已带出锁外，攒进本批 flushBatch，淘汰结束统一提交
 		*/
 		if (dirty) {
-			diskThread->push([this, victim, val = std::move(val)]() {
-				disk->persisData(victim, val);
-				}, DISK_TASK);
+			flushBatch.emplace_back(victim, std::move(val));	// 只移动进批（拷贝已在上锁段完成）
 		}
+	}
+	// 批尾统一组写入落盘（一次文件开关写多条，提交即返回，不等待刷盘结果）
+	if (!flushBatch.empty()) {
+		diskThread->push([this, batch = std::move(flushBatch)]() {
+			disk->persisData(std::move(batch));
+		}, DISK_TASK);
 	}
 	evDone();	// 采样循环结束（容量已达标或缓存已空）：统一记账
 }
@@ -171,111 +178,132 @@ void Cache::bind(std::shared_ptr<DiskThread> diskThread, std::shared_ptr<Disk> d
 
 std::future<SelResult> Cache::selData(const std::string& varName)
 {
-	// 查询链：读线程池执行（命中纯读零写，不产生任何写任务），结果经 future 带回
-	return readPool->submit([this, varName]() -> SelResult {
-		/* 1. 共享锁探测缓存 + 过期判定 */
-		bool inCache = false, expired = false;
-		std::shared_ptr<std::any> entity;	// 命中：锁内拷贝实体指针（只拷贝指针，实体零拷贝）
-		{
-			rwMutex->lock_shared();
-			auto it = cache_db.find(varName);
-			if (it != cache_db.end()) {
-				inCache = true;
-				expired = !it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now();
-				if (!expired) entity = it->second.entity;	// 与缓存共享同一实体指针
-			}
-			rwMutex->unlock_shared();
-		}
+	// 查询链两段式（AsyncResult 续延）：读池线程永不阻塞在磁盘 IO 上（谁等结果谁阻塞 = 调用方，中间服务线程不等）
+	//   段1（读池）：锁内探测缓存，命中/过期直接兑现；未命中只提交磁盘任务即返回，线程归还读池
+	//   段2（磁盘线程）：读盘 + 过期判定；读回成功直接兑现结果，回填照旧投递写线程后台（兑现不依赖写线程队列）
+	// run() 统一把异常转 set_exception（读池/写线程的 work() 会吞异常，漏记会让调用方 get() 永久等待）
+	AsyncResult<SelResult> ar{ SelResult{ UNKNOWN_ERROR, nullptr } };	// 兜底：线程已停止/段被拒收时返回未知错误
+	auto fut = ar.future();
 
-		if (inCache && !expired) {
-			// 命中未过期：直接返回实体指针（不刷新时间/顺序信息，命中路径唯一的原子写 = 统计自增）
-			statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计
-			return SelResult{ SUCCESS, std::move(entity) };
-		}
-		if (inCache && expired) {
-			// 命中已过期：返回 EXPIRED；清理交两条平级任务（写线程删缓存 + 磁盘线程删 inDisk），提交即返回不等待
-			statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计：缓存中存在即算命中（含过期，TTL 语义由清理管）
-			writeThread->push([this, varName]() {
-				rwMutex->lock();	// 删缓存是写操作，独占锁
+	auto submitOk = readPool->submit([this, varName, ar]() mutable {
+		ar.run([&]() {
+			/* 1. 共享锁探测缓存 + 过期判定 */
+			bool inCache = false, expired = false;
+			std::shared_ptr<std::any> entity;	// 命中：锁内拷贝实体指针（只拷贝指针，实体零拷贝）
+			{
+				rwMutex->lock_shared();
 				auto it = cache_db.find(varName);
-				if (it != cache_db.end()) {	// 排队期间可能已被并发删除，跳过
-					curSize -= it->second.dataSize;	// 更新缓存当前大小
-					cache_db.erase(it);				// 删除该数据
+				if (it != cache_db.end()) {
+					inCache = true;
+					expired = !it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now();
+					if (!expired) entity = it->second.entity;	// 与缓存共享同一实体指针
 				}
-				rwMutex->unlock();
-			});
-			diskThread->push([this, varName]() { disk->delData(varName); }, CACHE_TASK);	// 删磁盘索引，防复活
-			return SelResult{ EXPIRED, nullptr };
-		}
-
-		/* 2. 未命中：读盘在磁盘线程任务内完成"读盘 + 过期判定 + 过期直删"，读池任务等待这一轮磁盘 IO */
-		statMiss.fetch_add(1, std::memory_order_relaxed);	// 未命中统计（转入磁盘读取，读回成败均算未命中）
-		auto fut = diskThread->submit([this, varName]() -> std::pair<int, Val> {
-			std::any res;	// 读出的实体（本任务局部变量，不引用调用方栈帧）
-			Val val;		// 读出的时间信息（是否永久/过期时间/更新时间等）
-			int code = disk->selData(varName, res, val);
-			if (code != SUCCESS) return std::make_pair(code, Val{});	// 磁盘也没有/读失败
-			// 已过期：已在磁盘线程，直接删除（不二次提交删除任务），数据舍弃不回填
-			if (!val.isPermanent && val.expireTime <= std::chrono::system_clock::now()) {
-				disk->delData(varName);	// 过期数据：删磁盘索引防复活
-				return std::make_pair(EXPIRED, Val{});
+				rwMutex->unlock_shared();
 			}
-			val.entity = std::make_shared<std::any>(std::move(res));	// 读出的实体包进指针，随结果带回
-			return std::make_pair(SUCCESS, std::move(val));
-		}, DISK_TASK);	// 读文件，磁盘 IO 任务
 
-		auto ret = fut.get();	// 读池任务等待磁盘线程读盘
-		int code = ret.first;
-		if (code != SUCCESS) return SelResult{ code, nullptr };
-
-		// 3. 磁盘读回且未过期：回填交写线程后台（push 不等待；闭包值捕获含 shared_ptr 的 Val，读出实体保活）
-		//    返回的实体指针先拷出一份（与回填共享同一实体），上层拿到后写线程再回填也不冲突
-		Val val = std::move(ret.second);
-		std::shared_ptr<std::any> retEntity = val.entity;	// 返回给上层的实体指针
-		writeThread->push([this, varName, val = std::move(val)]() mutable {	// mutable：任务内要修改捕获的 Val（标脏/更新时间）
-			rwMutex->lock();	// 回填是写操作，独占锁
-			if (!cache_db.contains(varName)) {	// 锁内重校验：排队期间可能已并发插入，存在则跳过
-				val.isDirty = false;	// 磁盘读回的数据是干净的
-				val.updateTime = std::chrono::system_clock::now();	// 回填视为一次写入访问（写路径才更新）
-				long long dataSize = val.dataSize;	// move 前先取大小
-				cache_db.emplace(varName, std::move(val));	// 移动进缓存，实体指针零拷贝
-				curSize += dataSize;			// 更新缓存当前大小
+			if (inCache && !expired) {
+				// 命中未过期：直接兑现（不刷新时间/顺序信息，命中路径唯一的原子写 = 统计自增）
+				statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计
+				ar.done(SelResult{ SUCCESS, std::move(entity) });
+				return;
 			}
-			long long sizeNow = curSize;	// 锁内快照：解锁后判断是否触发淘汰
-			rwMutex->unlock();
-			// 回填会增大缓存：超限触发淘汰（全局采样，写线程内阻塞执行）
-			if (sizeNow > memoSize) evict();
+			if (inCache && expired) {
+			// 命中已过期：返回 EXPIRED；清理交两条平级任务（写线程删缓存 + 磁盘线程删 inDisk），提交即返回不等待
+				statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计：缓存中存在即算命中（含过期，TTL 语义由清理管）
+				writeThread->push([this, varName]() {
+					rwMutex->lock();	// 删缓存是写操作，独占锁
+					auto it = cache_db.find(varName);
+					if (it != cache_db.end()) {	// 排队期间可能已被并发删除，跳过
+						curSize -= it->second.dataSize;	// 更新缓存当前大小
+						cache_db.erase(it);				// 删除该数据
+					}
+					rwMutex->unlock();
+				});
+				diskThread->push([this, varName]() { disk->delData(varName); }, CACHE_TASK);	// 删磁盘索引，防复活
+				ar.done(SelResult{ EXPIRED, nullptr });
+				return;
+			}
+
+			/* 2. 未命中：段1到此为止——只提交磁盘任务立即返回，读池线程不被磁盘 IO 占住 */
+			statMiss.fetch_add(1, std::memory_order_relaxed);	// 未命中统计（转入磁盘读取，读回成败均算未命中）
+			auto ioFut = diskThread->submit([this, varName, ar]() mutable {
+				// 段2（磁盘线程）：读盘 + 过期判定 + 过期直删，完成后直接兑现；回填交写线程后台
+				ar.run([&]() {
+					std::any res;	// 读出的实体（本任务局部变量，不引用调用方栈帧）
+					Val val;		// 读出的时间信息（是否永久/过期时间/更新时间等）
+					int code = disk->selData(varName, res, val);
+					if (code != SUCCESS) {	// 磁盘也没有/读失败
+						ar.done(SelResult{ code, nullptr });
+						return;
+					}
+					// 已过期：已在磁盘线程，直接删除（不二次提交删除任务），数据舍弃不回填
+					if (!val.isPermanent && val.expireTime <= std::chrono::system_clock::now()) {
+						disk->delData(varName);	// 过期数据：删磁盘索引防复活
+						ar.done(SelResult{ EXPIRED, nullptr });
+						return;
+					}
+					val.entity = std::make_shared<std::any>(std::move(res));	// 读出的实体包进指针
+					// 回填交写线程后台（push 不等待；闭包值捕获含 shared_ptr 的 Val，读出实体保活）
+					// 返回的实体指针先拷出一份（与回填共享同一实体），上层拿到后写线程再回填也不冲突
+					std::shared_ptr<std::any> retEntity = val.entity;	// 返回给上层的实体指针
+					writeThread->push([this, varName, val = std::move(val)]() mutable {	// mutable：任务内要修改捕获的 Val（标脏/更新时间）
+						rwMutex->lock();	// 回填是写操作，独占锁
+						if (!cache_db.contains(varName)) {	// 锁内重校验：排队期间可能已并发插入，存在则跳过
+							val.isDirty = false;	// 磁盘读回的数据是干净的
+							val.updateTime = std::chrono::system_clock::now();	// 回填视为一次写入访问（写路径才更新）
+							long long dataSize = val.dataSize;	// move 前先取大小
+							cache_db.emplace(varName, std::move(val));	// 移动进缓存，实体指针零拷贝
+							curSize += dataSize;			// 更新缓存当前大小
+						}
+						long long sizeNow = curSize;	// 锁内快照：解锁后判断是否触发淘汰
+						rwMutex->unlock();
+						// 回填会增大缓存：超限触发淘汰（全局采样，写线程内阻塞执行）
+						if (sizeNow > memoSize) evict();
+					});
+					ar.done(SelResult{ SUCCESS, std::move(retEntity) });	// 与回填同一实体指针，兑现"成功"
+				});
+			}, DISK_TASK);	// 读文件，磁盘 IO 任务
+			if (!ioFut.valid()) ar.fallback();	// 磁盘线程已停止（任务被拒收）：兜底兑现错误态，防调用方永久等待
 		});
-		return SelResult{ SUCCESS, std::move(retEntity) };	// 与回填同一实体指针，返回"成功"
 	});
+	if (!submitOk.valid()) ar.fallback();	// 读线程池已停止（任务被拒收）：兜底兑现错误态
+	return fut;
 }
 
 std::future<int> Cache::delData(const std::string& varName)
 {
-	// 删除是写操作：缓存删 + 磁盘索引删整条链封装为一个写线程任务
-	// 调用线程不阻塞（提交任务后立即返回 future）；淘汰阻塞执行时本任务在写线程队列内自然等待
-	return writeThread->submit([this, varName]() -> int {
-		// 1. 独占锁内删缓存条目（命中即删除已生效）
-		bool cacheHit = false;	// 缓存是否命中（命中即已删除，磁盘无记录不算失败）
-		{
-			rwMutex->lock();	// 写锁统一由写线程执行
-			auto it = cache_db.find(varName);
-			if (it != cache_db.end()) {
-				curSize -= it->second.dataSize;	// 更新缓存当前大小
-				cache_db.erase(it);				// 命中：从缓存移除
-				cacheHit = true;
+	// 续延链（写线程不被磁盘同步等待占死）：段1（写线程）独占锁内删缓存 → 段2（磁盘线程）删磁盘索引
+	// 只有调用方等结果，服务线程只投递不等待
+	AsyncResult<int> ar{ UNKNOWN_ERROR };	// 兜底：线程已停止/段被拒收时返回未知错误
+	auto fut = ar.future();
+	auto submitOk = writeThread->submit([this, varName, ar]() mutable {
+		ar.run([&]() {
+			// 1. 独占锁内删缓存条目（命中即删除已生效）
+			bool cacheHit = false;	// 缓存是否命中（命中即已删除，磁盘无记录不算失败）
+			{
+				rwMutex->lock();	// 写锁统一由写线程执行
+				auto it = cache_db.find(varName);
+				if (it != cache_db.end()) {
+					curSize -= it->second.dataSize;	// 更新缓存当前大小
+					cache_db.erase(it);				// 命中：从缓存移除
+					cacheHit = true;
+				}
+				rwMutex->unlock();
 			}
-			rwMutex->unlock();
-		}
 
-		// 2. 磁盘索引删除：短暂等待磁盘线程快速任务（CACHE_TASK 微秒级：查 inDisk 删索引，只动内存不进文件）
-		//    缓存命中但磁盘无记录（数据从未落盘）：删除已生效，返回成功；缓存磁盘都没有才算未找到
-		std::future<int> fut = diskThread->submit([this, varName, cacheHit]() {
-			int code = disk->delData(varName);
-			return (code == FIND_FAILED && cacheHit) ? SUCCESS : code;
-		}, CACHE_TASK);
-		return fut.get();	// 写线程短暂等待磁盘线程快速任务
+			// 2. 段2（磁盘线程）：磁盘索引删除（CACHE_TASK 微秒级：查 inDisk 删索引，只动内存不进文件）
+			//    缓存命中但磁盘无记录（数据从未落盘）：删除已生效，返回成功；缓存磁盘都没有才算未找到
+			auto ioFut = diskThread->submit([this, varName, cacheHit, ar]() mutable {
+				ar.run([&]() {
+					int code = disk->delData(varName);
+					ar.done((code == FIND_FAILED && cacheHit) ? SUCCESS : code);
+				});
+			}, CACHE_TASK);
+			if (!ioFut.valid()) ar.fallback();	// 磁盘线程已停止：段2 被拒收
+		});
 	});
+	if (!submitOk.valid()) ar.fallback();	// 写线程已停止：段1 被拒收
+	return fut;
 }
 
 std::future<int> Cache::persisVar(const std::string& varName)
