@@ -534,6 +534,7 @@ int Disk::flushDisk()
             auto& val = it->second;
             if (!val.isPermanent && val.expireTime <= now) {
                 // 过期：直接删除（缓存权威，过期数据不落盘）
+                c->curSize -= val.dataSize;	// 更新缓存当前大小
                 inDisk.erase(it->first);
                 it = c->cache_db.erase(it);
             } else {
@@ -565,6 +566,7 @@ int Disk::reWrite()
         while (it != c->cache_db.end()) {
             auto& val = it->second;
             if (!val.isPermanent && val.expireTime <= now) {
+                c->curSize -= val.dataSize;	// 更新缓存当前大小
                 inDisk.erase(it->first);	// 磁盘索引删：重写主循环不再搬移它
                 it = c->cache_db.erase(it);
             } else {

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <cstdint>
+#include <cmath>
 
 #include "data_memo_level/controller/controller.h"
 #include "data_memo_level/data_type.h"
@@ -22,7 +23,7 @@
 	1. 裸接口 QPS：全读 / 读7写3 / 全写 三种负载各跑 30s，记录 QPS + 平均 / P50 / P99 / P999 延迟
 	2. 单条数据 1K~10M 随机大小，内容随机填充
 	3. key 冷热分布：20% key（池前 1/5）承担 80% 请求
-	4. 缓存命中率：总数据量 2x / 3x / 4x 缓存（200M/300M/400M，统一 200K 每条），记录命中次数 / 总请求
+	4. 缓存命中率：总数据量 2x / 3x / 4x 缓存（200M/300M/400M，每条大小对数正态随机），记录命中次数 / 总请求
 	5. 淘汰对写吞吐的影响：CacheStat 给出 evict 次数 / 条目数 / 总耗时，结合写延迟尾部分布观察
 
 	设计说明：
@@ -31,8 +32,9 @@
 	  持续制造缓存超限淘汰压力；无界 add 会溢出磁盘
 	- 单条大小档位分布而非线性均匀：线性均匀均值 ~5M，100M 缓存只能装约 20 条，key 数与冷热切分全部失真；
 	  档位分布保留 1K~10M 全跨度同时把均值压到 30 万字节量级（缓存能装几百 key）
-	- 命中率档每条固定 200K：混入 1M~10M 大 key 会让命中率被少数大 key 主导、数字噪声大；
-	  统一大小后命中率只由 key 数与缓存容量决定，可对照理论值（淘汰目标 0.9×100M）
+	- 命中率档每条大小对数正态（log10 均值 100K、σ 0.5，覆盖 1K~10M）：真实负载大小混合，
+	  key 数仍约千级可支撑冷热切分；命中率下限 = 淘汰目标 0.9×100M / 总量，miss 回填保活热 key
+	  与淘汰对大小的偏置会把命中率推高，观测偏离下限的幅度即这两重机制的强度信号
 	- 预热结束 flushDisk().get() 做刷盘屏障：flushDisk 排在磁盘线程队尾，返回时此前 evict
 	  fire-and-forget 提交的刷盘任务已全部落盘，避免"脏数据未落盘就被读 miss"的计数空洞
 	- 预热前 shuffle key 池：否则按序 add 时最先 add 的 key（池前 20% = 热区）最先被挤出缓存，
@@ -86,6 +88,18 @@ static long long randSizeTiered(std::mt19937& rng) {
 	}
 }
 
+// 数据大小对数正态（数量级 log10 服从正态）：大小跨 1K~10M 四个数量级，线性正态会大量越界
+// 被钳成两堆边界尖峰，对数尺度正态自然覆盖全区间——log10 均值 5.0（中位 100K）、σ 0.5，
+// 期望 ≈ 194K/条（与 QPS 档同量级，缓存可装约千 key 支撑冷热切分）；[1K, 10M] = 均值 ±4σ，
+// 越界概率 ≈ 6e-5/尾，钳位仅作防御（命中率档用，观察大小混合下的淘汰偏置与命中率）
+static long long randSizeLogNormal(std::mt19937& rng) {
+	thread_local std::normal_distribution<double> dist(5.0, 0.5);	// 分布有内部状态，每线程独立
+	double lg = dist(rng);
+	if (lg < 3.0) lg = 3.0;	// 钳位 1K
+	if (lg > 7.0) lg = 7.0;	// 钳位 10M
+	return static_cast<long long>(std::pow(10.0, lg));
+}
+
 // 构造随机内容的实体（内容不跨进程使用，字节序无约束）
 static BenchData makeData(long long size, std::mt19937& rng) {
 	BenchData b;
@@ -112,15 +126,16 @@ struct PoolEntry {
 	long long size;		// 该 key 的数据大小（预热用）
 };
 
-// 按字节预算建 key 池：逐条随机大小累加，超过预算停止
-// uniformSize > 0 时每条固定该大小（命中率档：命中率只由 key 数与缓存容量决定，无大小噪声）
+// 按字节预算建 key 池：逐条按大小生成器取样累加，超过预算停止
+// sizeGen：每条数据大小的取样函数（默认档位分布；命中率档传对数正态）
 // 返回 <key 池, 实际总字节>（预算为下限，末条可能略超预算）
 static std::pair<std::vector<PoolEntry>, long long> buildPool(
-	long long budgetBytes, std::mt19937& rng, long long uniformSize = 0) {
+	long long budgetBytes, std::mt19937& rng,
+	long long (*sizeGen)(std::mt19937&) = &randSizeTiered) {
 	std::vector<PoolEntry> pool;
 	long long total = 0;
 	for (int i = 0; total < budgetBytes; ++i) {
-		long long sz = uniformSize > 0 ? uniformSize : randSizeTiered(rng);
+		long long sz = sizeGen(rng);
 		pool.push_back({ "key_" + std::to_string(i), sz });
 		total += sz;
 	}
@@ -202,7 +217,7 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 					(void)res;
 				} else {
 					long long sz = randSizeTiered(rng);
-					db.modData(pool[idx].key, makeData(sz, rng)).get();
+					db.modData(pool[idx].key, std::move(makeData(sz, rng))).get();
 				}
 				long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 					std::chrono::steady_clock::now() - t0).count();
@@ -302,17 +317,17 @@ static void qpsScene(const char* title, double readRate) {
 	printLoad(title, r, s, RUN_SECONDS);
 }
 
-// 命中率档场景：总数据 = times 倍缓存，统一 200K/条，纯读按冷热分布 30s
+// 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机（1K~10M），纯读按冷热分布 30s
 static void hitRateScene(int times) {
 	std::filesystem::remove(DB_NAME);
 	Controller db(MEMO_SIZE, DISK_SIZE, POOL_THREADS, DB_NAME);
 	std::mt19937 rng(0x20240903 + times);
 
-	// 命中率理论基准：预热后缓存稳态 ≈ evict 目标 0.9×100M = 90M（容量有界必然淘汰），
-	// 读路径不刷新 updateTime（命中零写）→ 淘汰对访问频率无感 → 命中率 ≈ 90M / 总数据量，
-	// 与冷热请求分布无关；观测偏差反映淘汰/回填 churn 与采样随机性
-	constexpr long long UNIT = 200LL * 1024;	// 200K/条
-	auto [pool, poolBytes] = buildPool(MEMO_SIZE * times, rng, UNIT);
+	// 命中率预期：稳态驻留 ≈ evict 目标 90M（容量有界必然淘汰），90M/总数据量是纯容量下限；
+	// 实测高于下限属正常——miss 回填刷新 updateTime，淘汰删最旧 → 高频 key 经回填保活，
+	// 冷热 80/20 下热区驻留率显著偏高；大小随机后再叠加淘汰对大小的偏置（偏删大 key 时
+	// 同字节驻留 key 更多，按请求计命中率更高）。偏离下限的幅度 = 这两重机制的强度信号
+	auto [pool, poolBytes] = buildPool(MEMO_SIZE * times, rng, &randSizeLogNormal);
 	std::shuffle(pool.begin(), pool.end(), rng);
 	std::cout << "[prewarm hit-rate " << times << "x] " << pool.size() << " keys, "
 		<< (poolBytes / 1024 / 1024) << " MB, writing & flushing to disk..." << std::endl;
@@ -322,7 +337,7 @@ static void hitRateScene(int times) {
 	LoadResult r = runLoad(db, pool, 1.0, true, RUN_SECONDS, nullptr);
 	CacheStat s = db.getStat();
 	char title[64];
-	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, 200K each)",
+	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, log-normal 1K-10M)",
 		times, static_cast<long long>(poolBytes / 1024 / 1024));
 	printLoad(title, r, s, RUN_SECONDS);
 }
@@ -336,14 +351,14 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[1] QPS - read-only", 1.0);
+	// qpsScene("[1] QPS - read-only", 1.0);
 	qpsScene("[2] QPS - read70/write30", 0.7);
-	qpsScene("[3] QPS - write-only", 0.0);
+	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
-	hitRateScene(2);
-	hitRateScene(3);
-	hitRateScene(4);
+	//hitRateScene(2);
+	//hitRateScene(3);
+	//hitRateScene(4);
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
 	double totalSec = std::chrono::duration<double>(

@@ -146,7 +146,8 @@ public:
 				auto it = cache_db.find(varName);
 				if (it != cache_db.end()) {
 					curSize = curSize - it->second.dataSize + newSize;	// 先减旧再加新
-					it->second.entity = newEntity;	// 命中：替换实体指针（零拷贝）
+					auto oldEntity = std::move(it->second.entity);  // 移出旧实体,在锁外析构
+					it->second.entity = newEntity;                 // 放入新实体
 					it->second.dataSize = newSize;
 					it->second.updateTime = std::chrono::system_clock::now();	// 更新时间
 					it->second.isDirty = true;	// 标记为脏数据，等待刷盘
