@@ -49,3 +49,52 @@ D:\Work\project\personal_project\C++\myDB\out\build\x64-Debug\test\memo_test\Cac
 按任意键关闭此窗口. . 
 ```
 
+删除同步后：
+
+```
+================== START (performance benchmark) ==================
+[prewarm [1] QPS - read-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [1] QPS - read-only (duration 30s) =====
+  requests: 3842882 | QPS 128096
+  latency(us): mean 62 | P50 54 | P99 176 | P999 249
+  cache: hit 3842882 / miss 0 -> hit rate 100%
+  evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+[prewarm [2] QPS - read70/write30] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read70/write30 (duration 30s) =====
+  requests: 212248 | QPS 7074
+  latency(us): mean 1130 | P50 51 | P99 29177 | P999 64735
+  cache: hit 129534 / miss 19399 -> hit rate 86.9747%
+  evict: 483 calls / 12814 items / avg 1.39784 ms per call / evict-ratio 2.25052%
+[prewarm [3] QPS - write-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [3] QPS - write-only (duration 30s) =====
+  requests: 74978 | QPS 2499
+  latency(us): mean 3205 | P50 311 | P99 54239 | P999 106537
+  cache: hit 0 / miss 0 -> hit rate 0%
+  evict: 353 calls / 9475 items / avg 1.20673 ms per call / evict-ratio 1.41992%
+[prewarm hit-rate 2x] 1015 keys, 200 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 2x (total 200 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 274497 | QPS 9149
+  latency(us): mean 873 | P50 31 | P99 10121 | P999 16819
+  cache: hit 218269 / miss 56228 -> hit rate 79.516%
+  evict: 1036 calls / 53806 items / avg 2.4389 ms per call / evict-ratio 8.42234%
+[prewarm hit-rate 3x] 1560 keys, 300 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 3x (total 300 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 166429 | QPS 5547
+  latency(us): mean 1442 | P50 38 | P99 11117 | P999 31906
+  cache: hit 112006 / miss 54423 -> hit rate 67.2996%
+  evict: 982 calls / 53923 items / avg 2.60142 ms per call / evict-ratio 8.51531%
+[prewarm hit-rate 4x] 2084 keys, 400 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 4x (total 400 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 198381 | QPS 6612
+  latency(us): mean 1209 | P50 43 | P99 11119 | P999 23319
+  cache: hit 111338 / miss 87043 -> hit rate 56.1233%
+  evict: 1658 calls / 87036 items / avg 1.79319 ms per call / evict-ratio 9.91037%
+================== END, total 188s ==================
+```
+

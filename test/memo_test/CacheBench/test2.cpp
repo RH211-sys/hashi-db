@@ -351,14 +351,14 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[1] QPS - read-only", 1.0);
-	qpsScene("[2] QPS - read70/write30", 0.7);
-	qpsScene("[3] QPS - write-only", 0.0);
+	//qpsScene("[1] QPS - read-only", 1.0);
+	// qpsScene("[2] QPS - read70/write30", 0.7);
+	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
-	//hitRateScene(2);
-	//hitRateScene(3);
-	//hitRateScene(4);
+	hitRateScene(2);
+	hitRateScene(3);
+	hitRateScene(4);
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
 	double totalSec = std::chrono::duration<double>(

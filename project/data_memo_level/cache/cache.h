@@ -198,7 +198,7 @@ public:
 						auto oldEntity = std::move(it->second.entity);	// 移出旧实体，锁内只做指针交换，析构发生在解锁后
 						it->second.entity = newEntity;	// 放入新实体
 						it->second.dataSize = newSize;
-						it->second.updateTime = std::chrono::system_clock::now();	// 更新时间
+						// it->second.updateTime = std::chrono::system_clock::now();	// 不更新时间，因为写的可能是冷数据
 						it->second.isDirty = true;	// 标记为脏数据，等待刷盘
 						long long sizeNow = curSize;	// 锁内快照：解锁后判断是否触发淘汰
 						rwMutex->unlock();
@@ -218,7 +218,7 @@ public:
 						Val v;
 						v.typeName = T::getClassName();
 						v.isPermanent = true;	// 磁盘数据不存过期信息，默认永久
-						v.updateTime = std::chrono::system_clock::now();
+						// v.updateTime = std::chrono::system_clock::now(); 
 						v.isDirty = true;		// 脏数据，等待刷盘更新磁盘
 						v.dataSize = newSize;	// 数据大小
 						v.entity = newEntity;	// 与本次修改同一实体指针
