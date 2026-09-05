@@ -11,47 +11,48 @@
 #include <filesystem>
 #include <cstdint>
 #include <cmath>
+#include <future>
 
 #include "data_memo_level/controller/controller.h"
 #include "data_memo_level/data_type.h"
 
 /*
-	性能测试（memo_test2）：测存储层在固定时长窗口内的接口吞吐与延迟分布
-	配置：缓存 100M / 磁盘 500M / 读线程池 4 / 数据文件 test2_data.dat（与 test1 同命名风格）
+	性能测试（memo_test3）：存储层写并发版基准
+	============================================================
+	本文件以 test2.cpp 为蓝本（负载定义、数据分布、场景划分、输出格式保持一致），
+	核心增强：**写路径并发化压测**（这是相对 test2 的唯一关键差异）。
 
-	测试项：
-	1. 裸接口 QPS：全读 / 读7写3 / 全写 三种负载各跑 30s，记录 QPS + 平均 / P50 / P99 / P999 延迟
-	2. 单条数据 1K~10M 随机大小，内容随机填充
-	3. key 冷热分布：20% key（池前 1/5）承担 80% 请求
-	4. 缓存命中率：总数据量 2x / 3x / 4x 缓存（200M/300M/400M，每条大小对数正态随机），记录命中次数 / 总请求
-	5. 淘汰对写吞吐的影响：CacheStat 给出 evict 次数 / 条目数 / 总耗时，结合写延迟尾部分布观察
+	test2 的压测循环是"submit → 立即 get()"：
+	  每个压测线程同时在途请求 = 1 → 总在途 = WORKERS(8)。
+	  读7写3 时在途写 ≈ 8 × 0.3 = 2.4，全写时 = 8 → 写线程池(4线程)根本打不满，
+	  因此测不出"记录锁 + 写池"的并发收益。
 
-	设计说明：
-	- 命中率与淘汰数据来自 Cache 的只读统计接口（getStat，原子计数），黑盒无法区分缓存命中与磁盘读回
-	- 磁盘容量有界（500M）：写负载以 modData 热更新为主，另有注入线程限速 add 新 key 模拟"新增数据流"，
-	  持续制造缓存超限淘汰压力；无界 add 会溢出磁盘
-	- 单条大小档位分布而非线性均匀：线性均匀均值 ~5M，100M 缓存只能装约 20 条，key 数与冷热切分全部失真；
-	  档位分布保留 1K~10M 全跨度同时把均值压到 30 万字节量级（缓存能装几百 key）
-	- 命中率档每条大小对数正态（log10 均值 100K、σ 0.5，覆盖 1K~10M）：真实负载大小混合，
-	  key 数仍约千级可支撑冷热切分；命中率下限 = 淘汰目标 0.9×100M / 总量，miss 回填保活热 key
-	  与淘汰对大小的偏置会把命中率推高，观测偏离下限的幅度即这两重机制的强度信号
-	- 预热结束 flushDisk().get() 做刷盘屏障：flushDisk 排在磁盘线程队尾，返回时此前 evict
-	  fire-and-forget 提交的刷盘任务已全部落盘，避免"脏数据未落盘就被读 miss"的计数空洞
-	- 预热前 shuffle key 池：否则按序 add 时最先 add 的 key（池前 20% = 热区）最先被挤出缓存，
-	  热区系统性全部 miss，命中率数字失真
-	- 延迟样本蓄水池采样（每线程上限 20 万）：30s 高 QPS 全量样本会占数百 MB 内存，抽样不影响分位估计
-	- 运行时长 ≈ 6 场景 × (预热 + 30s)，命中率档预热需把 400M 数据写入并落盘，整体约数分钟
+	test3 的压测循环对**写请求**使用"环形在途窗口"（ring of futures）：
+	  每线程始终维持 WRITE_INFLIGHT 个在途 modData（完成一个才补一个）
+	  → 总在途写 = WORKERS × WRITE_INFLIGHT（默认 8 × 8 = 64），远超写池线程数，
+	  真正压出多线程写能力；读请求仍同步 submit+get（读并发由读池承载，与 test2 一致）。
+
+	场景与 test2 相同：
+	  1. QPS 档：全读 / 读7写3 / 全写（各 30s），记录 QPS + mean/P50/P99/P999
+	  2. 命中率档：总数据 = 缓存 2x/3x/4x，纯读 + 冷热 80/20，记录 hit/miss/hit-rate
+	  3. evict 统计：evict calls/items/总耗时 → evict-ratio（淘汰是否拖慢写）
+	  4. 数据特征：单条 1K~10M 档位分布 / 对数正态（与 test2 相同），内容随机填充
+	  5. 写场景注入线程：每 30ms add 一条新 key，持续制造淘汰压力；
+	     预热结束 flushDisk().get() 做刷盘屏障（脏数据全部落盘后再测）
+
+	输出格式与 test2 完全一致。设 WRITE_INFLIGHT=1 即退化为 test2 的同步写行为，可作对照。
 */
 
 // ============ 配置 ============
 
-constexpr long long MEMO_SIZE = 1000LL * 1024 * 1024;	// 缓存 1000M（超限触发全局采样淘汰）
-constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M（命中率档最大 4x = 400M 数据需落盘）
-constexpr int POOL_THREADS = 4;							// 读线程池线程数
-const std::string DB_NAME = "test2_data.dat";			// 数据库文件
-constexpr long long WARM_BYTES = 95LL * 1024 * 1024;	// QPS 档预热池 95M（接近缓存上限但预热不触发淘汰；写波动即超限）
+constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（超限触发全局采样淘汰）
+constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M
+constexpr int POOL_THREADS = 8;							// 读/写线程池线程数
+constexpr int WRITE_INFLIGHT = 4;						// 每线程在途写请求数（窗口深度；=1 退化为 test2 同步写）
+const std::string DB_NAME = "test3_data.dat";			// 数据文件
+constexpr long long WARM_BYTES = 95LL * 1024 * 1024;	// QPS 档预热池 70M（接近缓存上限但预热不触发淘汰；写波动即超限）
 constexpr double RUN_SECONDS = 30.0;					// 每场景固定时长
-constexpr int WORKERS = 8;								// 压测线程数（读池 4 线程 + 写线程 1，8 个发起者足够压满）
+constexpr int WORKERS = 8;								// 压测线程数
 constexpr int INJECT_MS = 30;							// 注入线程 add 间隔（约 33 条/s，30s 内磁盘余量内）
 constexpr size_t SAMPLE_CAP = 200000;					// 延迟样本蓄水池上限 / 线程
 
@@ -71,9 +72,8 @@ struct BenchData {
 
 static double unit(std::mt19937& rng) { return static_cast<double>(rng()) / static_cast<double>(rng.max()); }
 
-// 单条大小档位分布，覆盖 1K~10M 全跨度：
+// 单条大小档位分布，覆盖 1K~10M 全跨度（与 test2 一致）：
 //   70% [1K, 16K]   / 25% [16K, 1M]   / 5% [1M, 10M]
-//   高概率小数据保证 key 数量；低概率大数据制造大小波动（mod 替换大实体即触发淘汰）
 static long long randSizeTiered(std::mt19937& rng) {
 	constexpr long long K = 1024;
 	double u = unit(rng);
@@ -88,10 +88,7 @@ static long long randSizeTiered(std::mt19937& rng) {
 	}
 }
 
-// 数据大小对数正态（数量级 log10 服从正态）：大小跨 1K~10M 四个数量级，线性正态会大量越界
-// 被钳成两堆边界尖峰，对数尺度正态自然覆盖全区间——log10 均值 5.0（中位 100K）、σ 0.5，
-// 期望 ≈ 194K/条（与 QPS 档同量级，缓存可装约千 key 支撑冷热切分）；[1K, 10M] = 均值 ±4σ，
-// 越界概率 ≈ 6e-5/尾，钳位仅作防御（命中率档用，观察大小混合下的淘汰偏置与命中率）
+// 数据大小对数正态（log10 均值 5.0、σ 0.5，覆盖 1K~10M），与 test2 一致（命中率档用）
 static long long randSizeLogNormal(std::mt19937& rng) {
 	thread_local std::normal_distribution<double> dist(5.0, 0.5);	// 分布有内部状态，每线程独立
 	double lg = dist(rng);
@@ -105,7 +102,6 @@ static BenchData makeData(long long size, std::mt19937& rng) {
 	BenchData b;
 	b.size = size;
 	b.data.resize(size);
-	// 8 字节块走 mt19937_64（快），剩余字节走 rng 补齐
 	std::mt19937_64 r64{ rng() };
 	std::uint64_t tmp;
 	size_t i = 0;
@@ -126,9 +122,7 @@ struct PoolEntry {
 	long long size;		// 该 key 的数据大小（预热用）
 };
 
-// 按字节预算建 key 池：逐条按大小生成器取样累加，超过预算停止
-// sizeGen：每条数据大小的取样函数（默认档位分布；命中率档传对数正态）
-// 返回 <key 池, 实际总字节>（预算为下限，末条可能略超预算）
+// 按字节预算建 key 池（与 test2 一致）：逐条按大小生成器取样累加，超过预算停止
 static std::pair<std::vector<PoolEntry>, long long> buildPool(
 	long long budgetBytes, std::mt19937& rng,
 	long long (*sizeGen)(std::mt19937&) = &randSizeTiered) {
@@ -150,13 +144,12 @@ static void warmUp(Controller& db, std::vector<PoolEntry>& pool, std::mt19937& r
 		if (code != SUCCESS) ++fail;
 	}
 	if (fail > 0) std::cout << "  [warn] warmUp: " << fail << " adds failed" << std::endl;
-	// 刷盘屏障：flushDisk 排在磁盘线程队尾，get() 返回时 evict 提交的刷盘任务已全部落盘
 	db.flushDisk().get();
 }
 
 // ============ 延迟采样与压测循环 ============
 
-// 延迟样本蓄水池（单位 ns）：30s 高 QPS 全量样本占内存过大，水位线抽样保持总体分布
+// 延迟样本蓄水池（单位 ns），与 test2 一致
 struct Reservoir {
 	std::vector<long long> buf;
 	size_t seen = 0;
@@ -168,7 +161,7 @@ struct Reservoir {
 			return;
 		}
 		++seen;
-		size_t j = static_cast<size_t>(rng()) % seen;	// 蓄水池替换判定（% 取模偏差可忽略）
+		size_t j = static_cast<size_t>(rng()) % seen;	// 蓄水池替换判定
 		if (j < SAMPLE_CAP) buf[j] = ns;
 	}
 };
@@ -182,11 +175,16 @@ struct LoadResult {
 	double p999Us = 0;		// P999 延迟
 };
 
-// 压力循环：WORKERS 个测试线程在 seconds 秒内循环 submit + get()（端到端延迟 = 发起请求到拿到结果）
-// readRate：读概率，其余为写（写 = modData 热更新：磁盘容量有界，无界 add 会溢出磁盘；
-//   modData 与 addData 走同一条写线程路径，替换大实体同样触发淘汰，是容量有界系统的真实稳态写形态）
-// hotSpot：请求分布 20% key（池前 1/5）承担 80% 请求
-// injectPool 非空：注入线程每 INJECT_MS 顺次 add 一条新 key（模拟新增数据流，持续制造淘汰压力）
+/*
+	压力循环（test3 写并发版）：
+	- 读请求：同步 submit + get()（与 test2 相同；读并发 = WORKERS）
+	- 写请求：环形在途窗口（与 test2 的关键差异）
+	  —— 每线程预填 WRITE_INFLIGHT 个在途 modData，每次"取回最旧完成的"再补一个新写，
+	     稳态在途写 = WORKERS × WRITE_INFLIGHT，打满写线程池（POOL_THREADS=4）
+	- readRate：读概率，其余为写（写 = modData 热更新）
+	- hotSpot：请求分布 20% key（池前 1/5）承担 80% 请求
+	- injectPool 非空：注入线程每 INJECT_MS 顺次 add 一条新 key（持续制造淘汰压力）
+*/
 static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 	double readRate, bool hotSpot, double seconds, const std::vector<PoolEntry>* injectPool = nullptr) {
 	std::atomic<bool> stop{ false };
@@ -207,21 +205,50 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 		workers.emplace_back([&, w]() {
 			std::mt19937 rng(0x5EED + w * 7919);
 			long long localDone = 0;
+
+			// 写环形在途窗口：每个槽 = 一个已提交未取回的 modData + 其提交时刻
+			// （key 随机选取，避免全部打同一 key 被记录锁串行）
+			struct WriteSlot {
+				std::future<int> fut;	// 在途写请求
+				long long submitNs;		// 提交时刻（ns，算端到端延迟用）
+			};
+			std::vector<WriteSlot> win(WRITE_INFLIGHT);
+			// 只有 readRate < 1.0 时才预填写窗口
+			if (readRate < 1.0) {
+				for (int i = 0; i < WRITE_INFLIGHT; ++i) {
+					size_t idx = pickIdx(rng);
+					auto t0 = std::chrono::steady_clock::now();
+					win[i].submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+					win[i].fut = db.modData(pool[idx].key, std::move(makeData(randSizeTiered(rng), rng)));
+				}
+			}
+			int winHead = 0;	// 当前要取回的最旧写槽
+
 			while (!stop.load(std::memory_order_relaxed)) {
 				bool isRead = unit(rng) < readRate;
 				size_t idx = pickIdx(rng);
-				auto t0 = std::chrono::steady_clock::now();
 				if (isRead) {
-					// 只测时序不校验值：读结果体拿 resCode 即弃（命中/磁盘读回都算一次查询）
+					// 读：同步提交 + get()（与 test2 相同，读并发由读池承载）
+					auto t0 = std::chrono::steady_clock::now();
 					auto res = db.selData(pool[idx].key).get();
 					(void)res;
+					long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now() - t0).count();
+					samples[w].add(ns, rng);
 				} else {
-					long long sz = randSizeTiered(rng);
-					db.modData(pool[idx].key, std::move(makeData(sz, rng))).get();
+					// 写：取回最旧完成的写 → 记录延迟 → 原地补一个新写（窗口保持满）
+					WriteSlot& s = win[winHead];
+					int code = s.fut.get();
+					(void)code;
+					long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now().time_since_epoch()).count() - s.submitNs;
+					samples[w].add(ns, rng);
+
+					auto t0 = std::chrono::steady_clock::now();
+					s.submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+					s.fut = db.modData(pool[idx].key, std::move(makeData(randSizeTiered(rng), rng)));
+					winHead = (winHead + 1) % WRITE_INFLIGHT;
 				}
-				long long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					std::chrono::steady_clock::now() - t0).count();
-				samples[w].add(ns, rng);
 				++localDone;
 			}
 			done[w] = localDone;
@@ -247,7 +274,7 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 	for (auto& t : workers) t.join();
 	if (injector.joinable()) injector.join();
 
-	// 汇总：合并蓄水池样本排序取分位（8 线程 × 20 万 ≤ 160 万，可接受）
+	// 汇总：合并蓄水池样本排序取分位
 	LoadResult out;
 	long long totalNs = 0;
 	std::vector<long long> all;
@@ -281,7 +308,7 @@ static void printLoad(const char* title, const LoadResult& r, const CacheStat& s
 	long long seen = s.hit + s.miss;
 	double hitRate = seen > 0 ? 100.0 * s.hit / seen : 0.0;
 	double evictAvgMs = s.evictCnt > 0 ? static_cast<double>(s.evictUs) / s.evictCnt / 1000.0 : 0.0;
-	double evictRatio = s.evictUs > 0 ? 100.0 * s.evictUs / (seconds * 1000 * 1000) : 0.0;	// evict 阻塞写线程的时间占比（上界）
+	double evictRatio = s.evictUs > 0 ? 100.0 * s.evictUs / (seconds * 1000 * 1000) : 0.0;	// evict 总耗时 / 测试总时长（淘汰线程自身开销占比，不再表示占用写线程）
 	std::cout << "  cache: hit " << s.hit << " / miss " << s.miss
 		<< " -> hit rate " << hitRate << "%" << std::endl;
 	std::cout << "  evict: " << s.evictCnt << " calls / " << s.evictItems << " items / avg "
@@ -301,9 +328,9 @@ static void qpsScene(const char* title, double readRate) {
 	std::cout << "[prewarm " << title << "] pool " << pool.size() << " keys, "
 		<< (poolBytes / 1024 / 1024) << " MB, writing & flushing to disk..." << std::endl;
 	warmUp(db, pool, rng);
-	std::cout << "[prewarm done] load running for 30s" << std::endl;
+	std::cout << "[prewarm done] load running for 30s (WRITE_INFLIGHT=" << WRITE_INFLIGHT << ")" << std::endl;
 
-	// 注入池（写场景）：约 800 条新 key ≈ 24s 注入量（磁盘余量 500M-95M 内；跑不完自动停，无影响）
+	// 注入池（写场景）：约 800 条新 key ≈ 24s 注入量
 	std::vector<PoolEntry> injectPool;
 	if (readRate < 1.0) {
 		std::mt19937 rng2(0x20250903);
@@ -317,16 +344,12 @@ static void qpsScene(const char* title, double readRate) {
 	printLoad(title, r, s, RUN_SECONDS);
 }
 
-// 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机（1K~10M），纯读按冷热分布 30s
+// 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机，纯读按冷热分布
 static void hitRateScene(int times) {
 	std::filesystem::remove(DB_NAME);
 	Controller db(MEMO_SIZE, DISK_SIZE, POOL_THREADS, DB_NAME);
 	std::mt19937 rng(0x20240903 + times);
 
-	// 命中率预期：稳态驻留 ≈ evict 目标 90M（容量有界必然淘汰），90M/总数据量是纯容量下限；
-	// 实测高于下限属正常——miss 回填刷新 updateTime，淘汰删最旧 → 高频 key 经回填保活，
-	// 冷热 80/20 下热区驻留率显著偏高；大小随机后再叠加淘汰对大小的偏置（偏删大 key 时
-	// 同字节驻留 key 更多，按请求计命中率更高）。偏离下限的幅度 = 这两重机制的强度信号
 	auto [pool, poolBytes] = buildPool(MEMO_SIZE * times, rng, &randSizeLogNormal);
 	std::shuffle(pool.begin(), pool.end(), rng);
 	std::cout << "[prewarm hit-rate " << times << "x] " << pool.size() << " keys, "
@@ -345,15 +368,15 @@ static void hitRateScene(int times) {
 // ============ main ============
 
 int main() {
-	std::cout << "================== START (performance benchmark) ==================" << std::endl;
+	std::cout << "================== START (performance benchmark, write-inflight edition) ==================" << std::endl;
 	DEFINE_DATA_TYPE(BenchData);
 
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
+	qpsScene("[2] QPS - read70/write30", 0.7);
 	qpsScene("[1] QPS - read-only", 1.0);
-	qpsScene("[2] QPS - read80/write20", 0.7);
-	qpsScene("[3] QPS - write-only", 0.0);
+	 qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
 	hitRateScene(2);
