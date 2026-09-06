@@ -50,8 +50,8 @@ std::future<int> Controller::reWrite()
 	return cache->reWrite();
 }
 
-CacheStat Controller::getStat() const
-{
-	// 统计快照读自缓存模块（原子计数），直接透传
-	return cache->getStat();
-}
+// CacheStat Controller::getStat() const
+// {
+// 	// 统计快照读自缓存模块（原子计数），直接透传
+// 	return cache->getStat();
+// }

@@ -14,16 +14,16 @@
 #include <exception>	// current_exception（AsyncResult 异常兜底）
 
 /*
-	缓存运行统计快照（供性能测试与运行观测）：命中/未命中/淘汰计数与耗时
-	计数为原子累加值，读取瞬间的一致性要求不高（观测用途）
+	测试统计记录（暂注释）：CacheStat / 命中未命中统计 / 淘汰统计 均为性能测试观测用，
+	主库运行不依赖；如需恢复：解开本处、Cache::getStat 与 cache.cpp 各 fetch_add 记账点
 */
-struct CacheStat {
-	long long hit = 0;			// 命中次数：缓存中存在即算命中（含已过期——过期是 TTL 语义，不算缓存未命中）
-	long long miss = 0;			// 未命中次数：缓存中不存在转入磁盘读取（磁盘读回成功与否都算缓存未命中）
-	long long evictCnt = 0;		// 淘汰执行次数
-	long long evictItems = 0;	// 淘汰条目数（过期批量清理 + 采样淘汰）
-	long long evictUs = 0;		// 淘汰总耗时（微秒）
-};
+// struct CacheStat {
+// 	long long hit = 0;			// 命中次数：缓存中存在即算命中（含已过期——过期是 TTL 语义，不算缓存未命中）
+// 	long long miss = 0;			// 未命中次数：缓存中不存在转入磁盘读取（磁盘读回成功与否都算缓存未命中）
+// 	long long evictCnt = 0;		// 淘汰执行次数
+// 	long long evictItems = 0;	// 淘汰条目数（过期批量清理 + 采样淘汰）
+// 	long long evictUs = 0;		// 淘汰总耗时（微秒）
+// };
 
 /*
 	异步结果桶（AsyncResult）：缓存接口在"服务线程不阻塞等待"的形态下跨线程兑现请求结果
@@ -77,12 +77,12 @@ private:
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
 	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
-	// 运行统计（原子计数，供 getStat() 观测；命中/未命中在热路径 relaxed 自增，evict 只在写线程执行无争抢）
-	std::atomic<long long> statHit{ 0 };		// 命中次数（缓存中存在即命中，含过期）
-	std::atomic<long long> statMiss{ 0 };		// 未命中次数（转入磁盘读取）
-	std::atomic<long long> statEvictCnt{ 0 };	// 淘汰执行次数
-	std::atomic<long long> statEvictItems{ 0 };	// 淘汰条目数（过期清理 + 采样淘汰）
-	std::atomic<long long> statEvictUs{ 0 };	// 淘汰总耗时（微秒）
+	// 运行统计原子计数（测试记录，暂注释，见顶部说明）
+	// std::atomic<long long> statHit{ 0 };		// 命中次数（缓存中存在即命中，含过期）
+	// std::atomic<long long> statMiss{ 0 };		// 未命中次数（转入磁盘读取）
+	// std::atomic<long long> statEvictCnt{ 0 };	// 淘汰执行次数
+	// std::atomic<long long> statEvictItems{ 0 };	// 淘汰条目数（过期清理 + 采样淘汰）
+	// std::atomic<long long> statEvictUs{ 0 };	// 淘汰总耗时（微秒）
 private:
 	// 淘汰分数计算：距上次写入的时间档位 × 档距 + ln(大小)，分数越高越优先淘汰
 	double evictScore(Val& val);
@@ -272,12 +272,12 @@ public:
 	// 数据重写：将缓存和inDisk中的所有数据写入到另一个文件中，并删除旧文件
 	std::future<int> reWrite();
 
-	/*
-		功能：读取缓存运行统计快照（命中/未命中/淘汰计数与耗时，供性能测试与运行观测）
-		参数：无
-		返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
-	*/
-	CacheStat getStat() const;
+	// /*
+	// 	功能：读取缓存运行统计快照（命中/未命中/淘汰计数与耗时，供性能测试与运行观测）
+	// 	参数：无
+	// 	返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
+	// */
+	// CacheStat getStat() const;
 };
 
 #endif // !_CACHE_H_

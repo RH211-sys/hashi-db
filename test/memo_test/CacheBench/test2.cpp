@@ -271,21 +271,22 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 
 // ============ 输出 ============
 
-static void printLoad(const char* title, const LoadResult& r, const CacheStat& s, double seconds) {
+static void printLoad(const char* title, const LoadResult& r, double seconds) {
 	std::cout << "===== " << title << " (duration " << seconds << "s) =====" << std::endl;
 	std::cout << "  requests: " << r.total << " | QPS " << static_cast<long long>(r.qps) << std::endl;
 	std::cout << "  latency(us): mean " << static_cast<long long>(r.meanUs)
 		<< " | P50 " << static_cast<long long>(r.p50Us)
 		<< " | P99 " << static_cast<long long>(r.p99Us)
 		<< " | P999 " << static_cast<long long>(r.p999Us) << std::endl;
-	long long seen = s.hit + s.miss;
-	double hitRate = seen > 0 ? 100.0 * s.hit / seen : 0.0;
-	double evictAvgMs = s.evictCnt > 0 ? static_cast<double>(s.evictUs) / s.evictCnt / 1000.0 : 0.0;
-	double evictRatio = s.evictUs > 0 ? 100.0 * s.evictUs / (seconds * 1000 * 1000) : 0.0;	// evict 阻塞写线程的时间占比（上界）
-	std::cout << "  cache: hit " << s.hit << " / miss " << s.miss
-		<< " -> hit rate " << hitRate << "%" << std::endl;
-	std::cout << "  evict: " << s.evictCnt << " calls / " << s.evictItems << " items / avg "
-		<< evictAvgMs << " ms per call / evict-ratio " << evictRatio << "%" << std::endl;
+	// 命中/淘汰统计打印（测试记录，暂注释，配合主库 CacheStat/getStat 注释，恢复时连同下方取 s 一起）：
+	// long long seen = s.hit + s.miss;
+	// double hitRate = seen > 0 ? 100.0 * s.hit / seen : 0.0;
+	// double evictAvgMs = s.evictCnt > 0 ? static_cast<double>(s.evictUs) / s.evictCnt / 1000.0 : 0.0;
+	// double evictRatio = s.evictUs > 0 ? 100.0 * s.evictUs / (seconds * 1000 * 1000) : 0.0;	// evict 阻塞写线程的时间占比（上界）
+	// std::cout << "  cache: hit " << s.hit << " / miss " << s.miss
+	// 	<< " -> hit rate " << hitRate << "%" << std::endl;
+	// std::cout << "  evict: " << s.evictCnt << " calls / " << s.evictItems << " items / avg "
+	// 	<< evictAvgMs << " ms per call / evict-ratio " << evictRatio << "%" << std::endl;
 }
 
 // ============ 场景 ============
@@ -313,8 +314,8 @@ static void qpsScene(const char* title, double readRate) {
 	}
 
 	LoadResult r = runLoad(db, pool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
-	CacheStat s = db.getStat();
-	printLoad(title, r, s, RUN_SECONDS);
+	// CacheStat s = db.getStat();	// 统计快照（测试记录，暂注释）
+	printLoad(title, r, RUN_SECONDS);
 }
 
 // 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机（1K~10M），纯读按冷热分布 30s
@@ -335,11 +336,11 @@ static void hitRateScene(int times) {
 	std::cout << "[prewarm done] load running for 30s" << std::endl;
 
 	LoadResult r = runLoad(db, pool, 1.0, true, RUN_SECONDS, nullptr);
-	CacheStat s = db.getStat();
+	// CacheStat s = db.getStat();	// 统计快照（测试记录，暂注释）
 	char title[64];
 	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, log-normal 1K-10M)",
 		times, static_cast<long long>(poolBytes / 1024 / 1024));
-	printLoad(title, r, s, RUN_SECONDS);
+	printLoad(title, r, RUN_SECONDS);
 }
 
 // ============ main ============
@@ -351,9 +352,9 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[1] QPS - read-only", 1.0);
-	qpsScene("[2] QPS - read80/write20", 0.7);
-	qpsScene("[3] QPS - write-only", 0.0);
+	// qpsScene("[1] QPS - read-only", 1.0);
+	// qpsScene("[2] QPS - read80/write20", 0.7);
+	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
 	//hitRateScene(2);
