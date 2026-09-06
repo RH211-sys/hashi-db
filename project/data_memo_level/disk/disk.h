@@ -25,6 +25,16 @@ struct DiskIoStat {
 	long long flushCnt = 0;		// flush 调用次数
 	long long readCnt = 0;		// 磁盘读成功次数（selData 单条：读回 + 反序列化）
 	long long readUs = 0;		// 磁盘读总耗时（µs，含文件开关与反序列化）
+	// —— miss 归类探针（缓存未命中后磁盘 selData 单条的去向）——
+	long long selCalls = 0;		// selData 单条进入次数（≈ 缓存 miss 数，取快照时可能含未执行任务）
+	long long selInDiskMiss = 0;// 未开文件即 inDisk 缺失：瞬态（已淘汰脏数据尚未落盘）+ 真不存在
+	long long selFileFail = 0;	// 开文件后失败总数（= 下列细分之和）
+	long long selFailCheck = 0;	// 首字节校验码不符 / 读头失败（offset 可能越界/错位）
+	long long selFailName = 0;	// 记录内嵌名字与查询名不符（offset 指向别条记录/截断头）
+	long long selFailEof = 0;	// 实体区读超 EOF（记录长度与文件不符）
+	long long selFailType = 0;	// 类型未注册
+	long long selFailOpen = 0;	// 文件打开失败
+	long long selOk = 0;		// 读盘成功（与 readCnt 同义，单独计数便于核对）
 };
 
 class Disk {
@@ -49,6 +59,16 @@ private:
 	std::atomic<long long> statFlushCnt{ 0 };
 	std::atomic<long long> statReadCnt{ 0 };
 	std::atomic<long long> statReadUs{ 0 };
+	// miss 归类探针计数
+	std::atomic<long long> statSelCalls{ 0 };
+	std::atomic<long long> statSelInDiskMiss{ 0 };
+	std::atomic<long long> statSelFileFail{ 0 };
+	std::atomic<long long> statSelFailCheck{ 0 };
+	std::atomic<long long> statSelFailName{ 0 };
+	std::atomic<long long> statSelFailEof{ 0 };
+	std::atomic<long long> statSelFailType{ 0 };
+	std::atomic<long long> statSelFailOpen{ 0 };
+	std::atomic<long long> statSelOk{ 0 };
 
 	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
 	bool ensureFileOpen();

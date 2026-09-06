@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <ostream>
 #include <streambuf>
 
@@ -44,6 +45,21 @@ namespace {
     constexpr std::size_t HEAD_TYPE = HEAD_PERM + IS_PERMANENT_LEN;
     constexpr std::size_t HEAD_NAME = HEAD_TYPE + TYPE_LEN;
     constexpr std::size_t HEAD_SIZE = HEAD_NAME + NAME_LEN;
+
+    // 磁盘读失败抽样打印（探针：只打印前若干次，输出 ASCII）
+    // codeByte/recSize 未知时传 -1；fileLen 现场量取
+    void reportSelFail(const std::string& dbName, const char* kind, const std::string& key,
+        long long offset, int codeByte, long long recSize) {
+        static std::atomic<int> remain{ 10 };
+        if (remain.fetch_sub(1) <= 0) return;
+        long long fileLen = -1;
+        {
+            std::ifstream f(dbName, std::ios::binary);
+            if (f) { f.seekg(0, std::ios::end); fileLen = static_cast<long long>(f.tellg()); }
+        }
+        std::cout << "[SEL-FAIL] kind=" << kind << " key=" << key << " offset=" << offset
+            << " codeByte=" << codeByte << " recSize=" << recSize << " fileLen=" << fileLen << std::endl;
+    }
 }
 
 
@@ -166,6 +182,15 @@ DiskIoStat Disk::getIoStat() const
     s.flushCnt = statFlushCnt.load(std::memory_order_relaxed);
     s.readCnt = statReadCnt.load(std::memory_order_relaxed);
     s.readUs = statReadUs.load(std::memory_order_relaxed);
+    s.selCalls = statSelCalls.load(std::memory_order_relaxed);
+    s.selInDiskMiss = statSelInDiskMiss.load(std::memory_order_relaxed);
+    s.selFileFail = statSelFileFail.load(std::memory_order_relaxed);
+    s.selFailCheck = statSelFailCheck.load(std::memory_order_relaxed);
+    s.selFailName = statSelFailName.load(std::memory_order_relaxed);
+    s.selFailEof = statSelFailEof.load(std::memory_order_relaxed);
+    s.selFailType = statSelFailType.load(std::memory_order_relaxed);
+    s.selFailOpen = statSelFailOpen.load(std::memory_order_relaxed);
+    s.selOk = statSelOk.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -414,9 +439,14 @@ int Disk::persisAll()
 
 int Disk::selData(const std::string& varName, std::any& res, Val& val)
 {
+    statSelCalls.fetch_add(1, std::memory_order_relaxed);	// 观测：进入（缓存未命中 → 磁盘读）
+
     /* ========== 查内存索引 =========== */
     auto it = inDisk.find(varName);
-    if (it == inDisk.end()) return FIND_FAILED;	// 磁盘没有该数据
+    if (it == inDisk.end()) {
+        statSelInDiskMiss.fetch_add(1, std::memory_order_relaxed);	// 观测：未开文件即缺失（含"已淘汰未落盘"瞬态与真不存在）
+        return FIND_FAILED;	// 磁盘没有该数据
+    }
     int offset = it->second;
 
     // 读耗时观测起点（含文件开关 + 读记录 + 反序列化，成功读回才记账）
@@ -424,13 +454,25 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
 
     /* ========== 打开文件读取 =========== */
     std::ifstream file(dbName, std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
+    if (!file) {
+        statSelFileFail.fetch_add(1, std::memory_order_relaxed);
+        statSelFailOpen.fetch_add(1, std::memory_order_relaxed);
+        reportSelFail(dbName, "open", varName, offset, -1, -1);	// 文件打开失败
+        return FILE_OPEN_FILED;
+    }
 
     /* ========== 读记录头 =========== */
     file.seekg(offset);
     char check = 0;
     file.read(&check, CODE_LEN);
-    if (!file || check != CHECK_VALID) return FIND_FAILED;	// 校验码无效：数据不完整
+    if (!file || check != CHECK_VALID) {
+        // 首字节校验码不符 / 头读失败（offset 越界或错位）——抽样打印现场
+        statSelFileFail.fetch_add(1, std::memory_order_relaxed);
+        statSelFailCheck.fetch_add(1, std::memory_order_relaxed);
+        reportSelFail(dbName, "check", varName, offset,
+            static_cast<int>(static_cast<unsigned char>(check)), -1);
+        return FIND_FAILED;	// 校验码无效：数据不完整
+    }
 
     int dataSize = 0;
     file.read((char*)&dataSize, ENTITY_SIZE_LEN);
@@ -448,17 +490,32 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     file.read(nameBuf, NAME_LEN);
 
     // 记录里的变量名应与查询名一致（防偏移错乱）
-    if (memcmp(nameBuf, varName.c_str(), varName.size()) != 0) return FIND_FAILED;
+    if (memcmp(nameBuf, varName.c_str(), varName.size()) != 0) {
+        statSelFileFail.fetch_add(1, std::memory_order_relaxed);
+        statSelFailName.fetch_add(1, std::memory_order_relaxed);
+        reportSelFail(dbName, "name", varName, offset, -1, dataSize);
+        return FIND_FAILED;
+    }
 
     /* ========== 读实体并反序列化 =========== */
     std::vector<char> bytes(dataSize);
     file.read(bytes.data(), dataSize);
-    if (!file) return FIND_FAILED;	// 读取失败（数据不完整）
+    if (!file) {
+        statSelFileFail.fetch_add(1, std::memory_order_relaxed);
+        statSelFailEof.fetch_add(1, std::memory_order_relaxed);
+        reportSelFail(dbName, "eof", varName, offset, -1, dataSize);	// 实体区读超 EOF
+        return FIND_FAILED;	// 读取失败（数据不完整）
+    }
 
     // 查类型注册表，反序列化实体（any 类型擦除，按 typeName 查表拿模板实例）
     std::string typeName(typeBuf);	// 截到 '\0'
     auto reg = typeReg.find(typeName);
-    if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+    if (reg == typeReg.end()) {
+        statSelFileFail.fetch_add(1, std::memory_order_relaxed);
+        statSelFailType.fetch_add(1, std::memory_order_relaxed);
+        reportSelFail(dbName, "type", varName, offset, -1, dataSize);	// 类型未注册
+        return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+    }
     res = reg->second.second(bytes);	// 反序列化 → any
 
     /* ========== 填时间信息 =========== */
@@ -472,6 +529,7 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     statReadUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);	// 磁盘读耗时记账
     statReadCnt.fetch_add(1, std::memory_order_relaxed);
+    statSelOk.fetch_add(1, std::memory_order_relaxed);	// 观测：读盘成功
     return SUCCESS;
 }
 

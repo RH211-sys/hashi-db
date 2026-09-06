@@ -300,6 +300,12 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 		<< " us | file " << (io.writeCnt ? io.fileUs / io.writeCnt : 0) << " us" << std::endl;
 	std::cout << "  disk-read: " << io.readCnt << " reads / " << (io.readUs / 1000) << " ms"
 		<< " (avg " << (io.readCnt ? io.readUs / io.readCnt : 0) << " us)" << std::endl;
+	double inDiskMissRatio = io.selCalls > 0 ? 100.0 * io.selInDiskMiss / io.selCalls : 0.0;
+	std::cout << "  disk-sel: calls " << io.selCalls << " | inDisk-miss " << io.selInDiskMiss
+		<< " (" << inDiskMissRatio << "%) | file-fail " << io.selFileFail
+		<< " | file-ok " << io.selOk << std::endl;
+	std::cout << "  disk-sel-fail: check " << io.selFailCheck << " | name " << io.selFailName
+		<< " | eof " << io.selFailEof << " | type " << io.selFailType << " | open " << io.selFailOpen << std::endl;
 	double busyRatio = q.busyUs > 0 ? 100.0 * (q.busyUs / 1000.0) / runMs : 0.0;
 	std::cout << "  disk-queue: depth avg " << q.avgDepth << " / max " << q.maxDepth
 		<< " | worker busy " << (q.busyUs / 1000) << " ms = " << busyRatio << "% (" << q.runCnt << " tasks)" << std::endl;
