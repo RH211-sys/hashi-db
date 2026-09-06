@@ -85,8 +85,8 @@ int Disk::persisData(const std::string& varName)
     int dataSize = (int)bytes.size();			// 数据大小：只含实体
     int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
-    // 时间信息：微秒整数（8B），与 std::chrono 互转
-    long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+    // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
+    long long updateUS = val.updateTime.load(std::memory_order_relaxed);
     long long expireUS = 
         val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -180,8 +180,8 @@ int Disk::persisData(const std::string& varName, const Val& val)
     int dataSize = (int)bytes.size();			// 数据大小：只含实体
     int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
-    // 时间信息：微秒整数（8B），与 std::chrono 互转
-    long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+    // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
+    long long updateUS = val.updateTime.load(std::memory_order_relaxed);
     long long expireUS =
         val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -262,8 +262,8 @@ int Disk::persisData(std::vector<std::pair<std::string, Val>> dataSet)
         int dataSize = (int)bytes.size();			// 数据大小：只含实体
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
-        // 时间信息：微秒整数（8B），与 std::chrono 互转
-        long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
+        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -367,8 +367,8 @@ int Disk::persisData(std::vector<std::string> varNameSet)
         int dataSize = (int)bytes.size();			// 数据大小：只含实体
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
 
-        // 时间信息：微秒整数（8B），与 std::chrono 互转
-        long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
+        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 
@@ -518,9 +518,10 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     /* ========== 填时间信息 =========== */
     val.typeName = typeName;
     val.dataSize = dataSize;	// 数据大小：实体字节数（回填缓存用）
-    val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
+    val.updateTime.store(updateUS, std::memory_order_relaxed);	// 记录里的更新时间（µs）
     val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
-    val.expireTime = val.isPermanent ? val.updateTime
+    val.expireTime = val.isPermanent
+        ? std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS))
         : std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
     return SUCCESS;
 }
@@ -580,9 +581,10 @@ int Disk::selData(std::vector<std::string>& varNameSet, std::vector<std::any>& r
 		Val val;
 		val.typeName = typeName;
 		val.dataSize = dataSize;	// 数据大小：实体字节数（回填缓存用）
-		val.updateTime = std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS));
+		val.updateTime.store(updateUS, std::memory_order_relaxed);	// 记录里的更新时间（µs）
 		val.isPermanent = isPermanent;	// char 转 bool：非 0 即 true
-		val.expireTime = val.isPermanent ? val.updateTime
+		val.expireTime = val.isPermanent
+			? std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS))
 			: std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
 		vals.emplace_back(std::move(val));
 		return SUCCESS;
@@ -700,8 +702,8 @@ int Disk::reWrite()
         int dataSize = (int)bytes.size();
         int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;
 
-        // 时间信息：微秒整数（8B），与 std::chrono 互转
-        long long updateUS = std::chrono::duration_cast<std::chrono::microseconds>(val.updateTime.time_since_epoch()).count();
+        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
+        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
         long long expireUS = val.isPermanent ? 0
             : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
 

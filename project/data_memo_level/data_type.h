@@ -9,6 +9,7 @@
 #include <string>
 #include <any>
 #include <chrono>
+#include <atomic>
 #include <sstream>
 #include <memory>
 #include "protocol.h"
@@ -65,14 +66,61 @@ std::any fromBytes(const std::vector<char>& bytes) {
     totalType.insert(#name); \
     typeReg.emplace(#name, std::make_pair(toBytes<name>, fromBytes<name>))
 
+/*
+	Val：缓存条目值结构（存放在 cache_db 的 value 中）
+	updateTime：缓存条目"热度"近似——最近一次读命中/插入时刻（µs since epoch，relaxed 原子）。
+		- 读命中刷新（relaxed store，消除原共享锁内非原子写的多读者数据竞争）
+		- addData 置 now；selData 磁盘回填沿用磁盘记录里的时间（不保活）；modData 回填保持默认 0（视为最冷）
+		- modData 命中不刷新（写可能是冷数据）
+		- evictScore 用它算"距上次访问间隔"分档；落盘时写入磁盘记录（内容与改动前一致）
+	其余字段在表锁/记录锁保护下读写；Val 含原子成员，拷贝/移动均自定义（原子字段 relaxed 取值），
+	淘汰快照、flushBatch、持久化拷贝等依赖 Val 可拷贝/移动的代码不受影响。
+*/
 struct Val {
 	std::string typeName;								// 类型名称
 	long long dataSize;									// 数据大小
 	bool isPermanent;									// 是否永不过期
 	std::chrono::system_clock::time_point expireTime;	// 过期时间
-	std::chrono::system_clock::time_point updateTime;	// 更新时间
+	std::atomic<long long> updateTime{ 0 };				// 最近读命中/插入时刻（µs since epoch，relaxed）
 	bool isDirty;										// 脏数据标记（true为脏，false为非脏）
 	std::shared_ptr<std::any> entity;					// 值实体（指针：写入时实体移进堆，命中/回填共享同一实体，零拷贝）
+
+	Val() = default;
+	// 拷贝/移动：原子字段按 relaxed load 取值（无并发写的移动源语义足够；拷贝用于锁内快照）
+	Val(const Val& o)
+		: typeName(o.typeName), dataSize(o.dataSize), isPermanent(o.isPermanent),
+		expireTime(o.expireTime),
+		updateTime(o.updateTime.load(std::memory_order_relaxed)),
+		isDirty(o.isDirty), entity(o.entity) {}
+	Val& operator=(const Val& o) {
+		if (this != &o) {
+			typeName = o.typeName;
+			dataSize = o.dataSize;
+			isPermanent = o.isPermanent;
+			expireTime = o.expireTime;
+			updateTime.store(o.updateTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			isDirty = o.isDirty;
+			entity = o.entity;
+		}
+		return *this;
+	}
+	Val(Val&& o) noexcept
+		: typeName(std::move(o.typeName)), dataSize(o.dataSize), isPermanent(o.isPermanent),
+		expireTime(o.expireTime),
+		updateTime(o.updateTime.load(std::memory_order_relaxed)),
+		isDirty(o.isDirty), entity(std::move(o.entity)) {}
+	Val& operator=(Val&& o) noexcept {
+		if (this != &o) {
+			typeName = std::move(o.typeName);
+			dataSize = o.dataSize;
+			isPermanent = o.isPermanent;
+			expireTime = o.expireTime;
+			updateTime.store(o.updateTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			isDirty = o.isDirty;
+			entity = std::move(o.entity);
+		}
+		return *this;
+	}
 };
 
 // 查询结果：selData 的 future 返回体，一个 future 带回错误码与查询实体

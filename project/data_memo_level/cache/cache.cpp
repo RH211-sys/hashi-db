@@ -15,10 +15,11 @@ Cache::Cache(const long long memoSize, const int batchSize, const int upDisEdge,
 /* =============== private =============== */
 
 double Cache::evictScore(Val& val) {
-	auto now = std::chrono::system_clock::now();
-	// 距上次写入间隔（微秒），下限取 1：只用于查档位，不取对数，无 log(0) 问题
-	// updateTime 只在写操作/回填等写路径更新，读命中不刷新（命中路径纯读零写）
-	long long intervalUs = std::chrono::duration_cast<std::chrono::microseconds>(now - val.updateTime).count();
+	// 距上次"读命中/插入"间隔（µs）：下限取 1，只用于查档位，不取对数，无 log(0) 问题
+	// updateTime = 最近读命中时刻（relaxed 原子）：读命中刷新（store）；modData 命中不刷新（写可能是冷数据）；
+	// addData 置 now、磁盘回填沿用磁盘记录旧时间、modData 回填保持默认 0（视为最冷）
+	long long intervalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count() - val.updateTime.load(std::memory_order_relaxed);
 	if (intervalUs < 1) intervalUs = 1;
 
 	// 时间档位（静态常量表）：<1min / <1h / <1d / <7d / ≥7d
@@ -65,17 +66,17 @@ void Cache::evict()
 	// 由写线程调用（addData/modData/回填超限后触发），全程串行、阻塞执行至容量达标		
 	long long target = memoSize * 9 / 10;
 	long long sizeNow = curSize;	// 当前大小（写线程串行上下文内维护）
-	// 淘汰统计记账（测试记录，暂注释）：evict 只在写线程执行，原子累加无争抢
-	// auto evStart = std::chrono::steady_clock::now();
-	// long long evictItems = 0;	// 本次淘汰条目数（过期清理 + 采样淘汰）
-	// auto evDone = [&]() {		// 出口统一记账（evict 有多个结束点，避免漏记）
-	// 	statEvictCnt.fetch_add(1, std::memory_order_relaxed);
-	// 	statEvictItems.fetch_add(evictItems, std::memory_order_relaxed);
-	// 	statEvictUs.fetch_add(static_cast<long long>(
-	// 		std::chrono::duration_cast<std::chrono::microseconds>(
-	// 			std::chrono::steady_clock::now() - evStart).count()),
-	// 		std::memory_order_relaxed);
-	// };
+	// 淘汰统计（供 getStat() 观测淘汰对写吞吐的影响）：evict 只在写线程执行，原子累加无争抢
+	auto evStart = std::chrono::steady_clock::now();
+	long long evictItems = 0;	// 本次淘汰条目数（过期清理 + 采样淘汰）
+	auto evDone = [&]() {		// 出口统一记账（evict 有多个结束点，避免漏记）
+		statEvictCnt.fetch_add(1, std::memory_order_relaxed);
+		statEvictItems.fetch_add(evictItems, std::memory_order_relaxed);
+		statEvictUs.fetch_add(static_cast<long long>(
+			std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - evStart).count()),
+			std::memory_order_relaxed);
+	};
 
 	// 脏数据攒批桶：采样淘汰循环中只收集（Val 拷贝已带出锁），淘汰结束统一组写入落盘（一次文件开关写整批）
 	std::vector<std::pair<std::string, Val>> flushBatch;
@@ -92,7 +93,7 @@ void Cache::evict()
 			Val& v = it->second;
 			if (!v.isPermanent && now >= v.expireTime) {
 				expiredNames.push_back(it->first);	// 更新删除集
-				// ++evictItems;					// 淘汰条目统计（过期清理，测试记录，暂注释）
+				++evictItems;						// 淘汰条目统计（过期清理）
 				curSize -= v.dataSize;				// 更新缓存当前大小
 				it = cache_db.erase(it);			// 删除该数据
 			} else {
@@ -108,10 +109,7 @@ void Cache::evict()
 			return disk->delData(std::move(expiredNames));
 		}, CACHE_TASK);	// 写线程短暂等待磁盘线程快速任务
 	}
-	if (sizeNow <= target) { 
-		// evDone();
-		return; 
-	}	// 删完过期已达目标，无需采样淘汰（evDone 记账已注释）
+	if (sizeNow <= target) { evDone(); return; }	// 删完过期已达目标，无需采样淘汰
 
 	// 2. 全局采样淘汰（无 LRU 链表）：不遍历整个缓存，从 cache_db 随机取样本算分入大顶堆
 	//    分数高 = 最优先淘汰；每轮直接取堆顶，堆空才补采一批（不每轮重采样）
@@ -157,14 +155,14 @@ void Cache::evict()
 			dirty = it->second.isDirty;
 			if (!dirty) {
 				// 干净数据：锁内直接删（磁盘已有副本，inDisk 不动，可读回）
-				// ++evictItems;				// 淘汰条目统计（测试记录，暂注释）
+				++evictItems;					// 淘汰条目统计
 				curSize -= it->second.dataSize;	// 更新缓存当前大小
 				cache_db.erase(it);				// 删除该数据
 			}
 			else {
 				// 脏数据：Val 拷贝出（shared_ptr 只增引用计数），随后删缓存减 curSize，不等待刷盘结果
 				val = it->second;
-				// ++evictItems;			// 淘汰条目统计（测试记录，暂注释）
+				++evictItems;				// 淘汰条目统计
 				curSize -= val.dataSize;	// 拷贝后从 val 取大小
 				cache_db.erase(it);
 			}
@@ -185,7 +183,7 @@ void Cache::evict()
 			disk->persisData(std::move(batch));
 		}, DISK_TASK);
 	}
-	// evDone();	// 采样循环结束（容量已达标或缓存已空）：统一记账（测试记录，暂注释）
+	evDone();	// 采样循环结束（容量已达标或缓存已空）：统一记账
 }
 
 /* =============== public =============== */
@@ -220,21 +218,25 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 					expired = !it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now();
 					if (!expired) {
 						entity = it->second.entity;	// 与缓存共享同一实体指针
-						it->second.updateTime = std::chrono::system_clock::now();  // 更新时间
+						// 读命中刷新热度（relaxed 原子 store：消除共享锁内多读者并发写同一字段的竞争）
+						it->second.updateTime.store(
+							std::chrono::duration_cast<std::chrono::microseconds>(
+								std::chrono::system_clock::now().time_since_epoch()).count(),
+							std::memory_order_relaxed);
 					}
 				}
 				rwMutex->unlock_shared();
 			}
 
 			if (inCache && !expired) {
-				// 命中未过期：直接兑现（不刷新时间/顺序信息，命中路径无原子写）
-				// statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计（测试记录，暂注释）
+				// 命中未过期：直接兑现（刷新 updateTime 为 relaxed 原子写，无其它锁内写）
+				statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计
 				ar.done(SelResult{ SUCCESS, std::move(entity) });
 				return;
 			}
 			if (inCache && expired) {
 			// 命中已过期：返回 EXPIRED；清理交两条平级任务（写线程删缓存 + 磁盘线程删 inDisk），提交即返回不等待
-				// statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计：缓存中存在即算命中（含过期，TTL 语义由清理管）（测试记录，暂注释）
+				statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计：缓存中存在即算命中（含过期，TTL 语义由清理管）
 				writeThread->push([this, varName]() {
 					rwMutex->lock();	// 删缓存是写操作，独占锁
 					auto it = cache_db.find(varName);
@@ -250,7 +252,7 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 			}
 
 			/* 2. 未命中：段1到此为止——只提交磁盘任务立即返回，读池线程不被磁盘 IO 占住 */
-			// statMiss.fetch_add(1, std::memory_order_relaxed);	// 未命中统计（转入磁盘读取，读回成败均算未命中）（测试记录，暂注释）
+			statMiss.fetch_add(1, std::memory_order_relaxed);	// 未命中统计（转入磁盘读取，读回成败均算未命中）
 			auto ioFut = diskThread->submit([this, varName, ar]() mutable {
 				// 段2（磁盘线程）：读盘 + 过期判定 + 过期直删，完成后直接兑现；回填交写线程后台
 				ar.run([&]() {
@@ -275,7 +277,7 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 						rwMutex->lock();	// 回填是写操作，独占锁
 						if (!cache_db.contains(varName)) {	// 锁内重校验：排队期间可能已并发插入，存在则跳过
 							val.isDirty = false;	// 磁盘读回的数据是干净的
-							// val.updateTime = std::chrono::system_clock::now();	// 回填视为一次写入访问（写路径才更新）
+							// updateTime 不置 now：沿用磁盘记录里的旧时间（回填不保活，热度靠后续读命中刷新）
 							long long dataSize = val.dataSize;	// move 前先取大小
 							cache_db.emplace(varName, std::move(val));	// 移动进缓存，实体指针零拷贝
 							curSize += dataSize;			// 更新缓存当前大小
@@ -366,14 +368,14 @@ std::future<int> Cache::reWrite()
 	return diskThread->submit([this]() { return disk->reWrite(); }, DISK_TASK);
 }
 
-// CacheStat Cache::getStat() const
-// {
-// 	// 原子读快照：统计是观测用途的累加值，relaxed 读即可（不追求同一时刻的一致性）
-// 	return CacheStat{
-// 		statHit.load(std::memory_order_relaxed),
-// 		statMiss.load(std::memory_order_relaxed),
-// 		statEvictCnt.load(std::memory_order_relaxed),
-// 		statEvictItems.load(std::memory_order_relaxed),
-// 		statEvictUs.load(std::memory_order_relaxed)
-// 	};
-// }
+CacheStat Cache::getStat() const
+{
+	// 原子读快照：统计是观测用途的累加值，relaxed 读即可（不追求同一时刻的一致性）
+	return CacheStat{
+		statHit.load(std::memory_order_relaxed),
+		statMiss.load(std::memory_order_relaxed),
+		statEvictCnt.load(std::memory_order_relaxed),
+		statEvictItems.load(std::memory_order_relaxed),
+		statEvictUs.load(std::memory_order_relaxed)
+	};
+}

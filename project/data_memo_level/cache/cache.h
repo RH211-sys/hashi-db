@@ -14,16 +14,17 @@
 #include <exception>	// current_exception（AsyncResult 异常兜底）
 
 /*
-	测试统计记录（暂注释）：CacheStat / 命中未命中统计 / 淘汰统计 均为性能测试观测用，
-	主库运行不依赖；如需恢复：解开本处、Cache::getStat 与 cache.cpp 各 fetch_add 记账点
+	缓存运行统计快照（供性能测试与运行观测）：命中/未命中/淘汰计数与耗时
+	计数为原子累加值，读取瞬间的一致性要求不高（观测用途）
+	命中/未命中在热路径 relaxed 自增；evict 只在写线程执行，原子累加无争抢
 */
-// struct CacheStat {
-// 	long long hit = 0;			// 命中次数：缓存中存在即算命中（含已过期——过期是 TTL 语义，不算缓存未命中）
-// 	long long miss = 0;			// 未命中次数：缓存中不存在转入磁盘读取（磁盘读回成功与否都算缓存未命中）
-// 	long long evictCnt = 0;		// 淘汰执行次数
-// 	long long evictItems = 0;	// 淘汰条目数（过期批量清理 + 采样淘汰）
-// 	long long evictUs = 0;		// 淘汰总耗时（微秒）
-// };
+struct CacheStat {
+	long long hit = 0;			// 命中次数：缓存中存在即算命中（含已过期——过期是 TTL 语义，不算缓存未命中）
+	long long miss = 0;			// 未命中次数：缓存中不存在转入磁盘读取（磁盘读回成功与否都算缓存未命中）
+	long long evictCnt = 0;		// 淘汰执行次数
+	long long evictItems = 0;	// 淘汰条目数（过期批量清理 + 采样淘汰）
+	long long evictUs = 0;		// 淘汰总耗时（微秒）
+};
 
 /*
 	异步结果桶（AsyncResult）：缓存接口在"服务线程不阻塞等待"的形态下跨线程兑现请求结果
@@ -77,14 +78,14 @@ private:
 	long long curSize;	// 当前缓存大小
 	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
 	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
-	// 运行统计原子计数（测试记录，暂注释，见顶部说明）
-	// std::atomic<long long> statHit{ 0 };		// 命中次数（缓存中存在即命中，含过期）
-	// std::atomic<long long> statMiss{ 0 };		// 未命中次数（转入磁盘读取）
-	// std::atomic<long long> statEvictCnt{ 0 };	// 淘汰执行次数
-	// std::atomic<long long> statEvictItems{ 0 };	// 淘汰条目数（过期清理 + 采样淘汰）
-	// std::atomic<long long> statEvictUs{ 0 };	// 淘汰总耗时（微秒）
+	// 运行统计（原子计数，供 getStat() 观测；命中/未命中在热路径 relaxed 自增，evict 只在写线程执行无争抢）
+	std::atomic<long long> statHit{ 0 };		// 命中次数（缓存中存在即命中，含过期）
+	std::atomic<long long> statMiss{ 0 };		// 未命中次数（转入磁盘读取）
+	std::atomic<long long> statEvictCnt{ 0 };	// 淘汰执行次数
+	std::atomic<long long> statEvictItems{ 0 };	// 淘汰条目数（过期清理 + 采样淘汰）
+	std::atomic<long long> statEvictUs{ 0 };	// 淘汰总耗时（微秒）
 private:
-	// 淘汰分数计算：距上次写入的时间档位 × 档距 + ln(大小)，分数越高越优先淘汰
+	// 淘汰分数计算：距上次读命中/插入的档位 × 档距 + ln(大小)，分数越高越优先淘汰
 	double evictScore(Val& val);
 	// 全局采样淘汰（无 LRU 链表）：随机桶采样(unordered_map的桶) + 优先队列，阻塞执行到容量达标（写线程内调用）
 	void evict();
@@ -124,9 +125,11 @@ public:
 				Val v;
 				v.typeName = T::getClassName();	// 类型名称
 				v.isPermanent = isPermanent;	// 是否永不过期
-				v.updateTime = std::chrono::system_clock::now();
+				long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::system_clock::now().time_since_epoch()).count();	// µs since epoch
+				v.updateTime.store(nowUs, std::memory_order_relaxed);	// 插入即"最近访问"= now
 				if (!isPermanent) {
-					v.expireTime = v.updateTime + during;	// 非永久：过期时间 = 更新时间 + 持续时间
+					v.expireTime = std::chrono::system_clock::time_point(std::chrono::microseconds(nowUs)) + during;	// 非永久：过期时间 = 更新时间 + 持续时间
 				}
 				v.isDirty = true;				// 新数据标记为脏，等待刷盘
 				v.dataSize = THE_SIZE(T, entity);	// 数据大小（用户自定义 theSize 计算）
@@ -272,12 +275,12 @@ public:
 	// 数据重写：将缓存和inDisk中的所有数据写入到另一个文件中，并删除旧文件
 	std::future<int> reWrite();
 
-	// /*
-	// 	功能：读取缓存运行统计快照（命中/未命中/淘汰计数与耗时，供性能测试与运行观测）
-	// 	参数：无
-	// 	返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
-	// */
-	// CacheStat getStat() const;
+	/*
+		功能：读取缓存运行统计快照（命中/未命中/淘汰计数与耗时，供性能测试与运行观测）
+		参数：无
+		返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
+	*/
+	CacheStat getStat() const;
 };
 
 #endif // !_CACHE_H_
