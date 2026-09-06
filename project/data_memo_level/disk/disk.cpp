@@ -152,6 +152,8 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
 
     // 原位覆盖优先：该 key 已有磁盘记录且新记录放得下旧槽 → 覆盖写（不追加、不增长、不触发容量压缩）
     if (tryOverwriteInPlace(varName)) return SUCCESS;
+    // 空洞复用其次：有空闲段放得下 → 写入洞内（不追加、不增长）
+    if (tryUseHole(varName)) return SUCCESS;
 
     // 容量执行（磁盘上限 = 配置的 maxSize，由业务侧设置）：
     // 追加后超过上限 → 先同线程压缩（reWrite 回收空洞并截断），压缩后仍放不下才拒绝(MEMO_OUT)
@@ -190,7 +192,11 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     statWriteCnt.fetch_add(1, std::memory_order_relaxed);
     statWriteBytes.fetch_add(static_cast<long long>(recBuf.size()), std::memory_order_relaxed);
 
-    // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
+    // 该 key 若之前已有磁盘记录（被新版本取代）：旧槽显式标记空洞并登记（防 loader 复活旧值、洞可复用）
+    auto oldIt = inDisk.find(varName);
+    if (oldIt != inDisk.end() && oldIt->second != static_cast<long long>(offset)) {
+        markDeleted(oldIt->second);
+    }
     inDisk[varName] = static_cast<long long>(offset);
     curSize += static_cast<long long>(recBuf.size());	// 只增不减：空洞/已删数据不回收，重写时重新统计
     return SUCCESS;
@@ -295,6 +301,61 @@ bool Disk::tryOverwriteInPlace(const std::string& varName)
     return true;	// inDisk/curSize 不变；flush 由调用方批处理
 }
 
+bool Disk::tryUseHole(const std::string& varName)
+{
+    // 空洞复用（best-fit）：取容量 ≥ 新长的最小洞，写入洞首（两段式）；
+    // 剩余 ≥ 洞头再切洞登记；写入已有洞 → 文件不增长、curSize 不变
+    long long need = static_cast<long long>(recBuf.size());
+    auto it = holes.lower_bound({ need, 0 });	// 按 (容量, 偏移) 有序：取最小够用洞
+    if (it == holes.end()) return false;
+    long long cap = it->first;
+    long long off = it->second;
+    holes.erase(it);
+    statHoleCnt.fetch_sub(1, std::memory_order_relaxed);
+    statHoleBytes.fetch_sub(cap, std::memory_order_relaxed);
+
+    if (!ensureFileOpen()) { addHole(off, cap); return false; }	// 句柄不可用：洞放回索引
+    auto t1 = std::chrono::steady_clock::now();
+    // 两段式写：recBuf 头为 BROKEN → 整条写 → 回写 VALID
+    file.seekp(off);
+    file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
+    file.seekp(off);
+    char valid = CHECK_VALID;
+    file.write(&valid, CODE_LEN);
+    long long remain = cap - need;
+    if (remain >= HEAD_SIZE) {
+        // 切出的剩余仍为洞：写 DELETED 洞头（code + dataSize=剩余容量-头）
+        long long holeDataSize = remain - HEAD_SIZE;
+        file.seekp(off + need);
+        char del = CHECK_DELETED;
+        file.write(&del, CODE_LEN);
+        int sz = static_cast<int>(holeDataSize);
+        file.write((char*)&sz, ENTITY_SIZE_LEN);
+    }
+    if (!file) {
+        // 写入失败：把该段恢复为洞并放回索引，返回 false（调用方回退追加）
+        file.clear();
+        file.seekp(off);
+        char del = CHECK_DELETED;
+        file.write(&del, CODE_LEN);
+        int sz = static_cast<int>(cap - HEAD_SIZE);
+        file.write((char*)&sz, ENTITY_SIZE_LEN);
+        addHole(off, cap);
+        return false;
+    }
+    if (remain >= HEAD_SIZE) addHole(off + need, remain);	// 登记切出的剩余洞
+
+    // 取代旧版本：若该 key 在 inDisk 有旧偏移且不同于本洞 → 旧槽显式标记空洞并登记（防 loader 复活旧值）
+    auto oldIt = inDisk.find(varName);
+    if (oldIt != inDisk.end() && oldIt->second != off) markDeleted(oldIt->second);
+    inDisk[varName] = off;
+    statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);
+    statWriteCnt.fetch_add(1, std::memory_order_relaxed);
+    statHoleUseCnt.fetch_add(1, std::memory_order_relaxed);
+    return true;	// curSize 不变（写入已有洞，文件不增长）；flush 由调用方批处理
+}
+
 DiskIoStat Disk::getIoStat() const
 {
     // 观测快照：relaxed 读即可（累加值，不强一致）
@@ -326,6 +387,7 @@ DiskIoStat Disk::getIoStat() const
     s.overwriteShrink = statOverwriteShrink.load(std::memory_order_relaxed);
     s.holeCnt = statHoleCnt.load(std::memory_order_relaxed);
     s.holeBytes = statHoleBytes.load(std::memory_order_relaxed);
+    s.holeUseCnt = statHoleUseCnt.load(std::memory_order_relaxed);
     return s;
 }
 

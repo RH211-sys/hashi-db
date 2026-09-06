@@ -300,6 +300,7 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 		<< " us | file " << (io.writeCnt ? io.fileUs / io.writeCnt : 0) << " us" << std::endl;
 	std::cout << "  disk-ovw/holes: overwrite " << io.overwriteCnt
 		<< " (same " << io.overwriteSame << " / shrink " << io.overwriteShrink << ")"
+		<< " | hole-use " << io.holeUseCnt
 		<< " | holes " << io.holeCnt << " segs / " << (io.holeBytes / 1024 / 1024) << " MB" << std::endl;
 	std::cout << "  disk-read: " << io.readCnt << " reads / " << (io.readUs / 1000) << " ms"
 		<< " (avg " << (io.readCnt ? io.readUs / io.readCnt : 0) << " us)" << std::endl;

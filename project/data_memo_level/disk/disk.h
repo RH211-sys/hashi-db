@@ -46,6 +46,7 @@ struct DiskIoStat {
 	long long overwriteShrink = 0;	// 覆盖且缩小（剩余≥86，登记剩余洞）
 	long long holeCnt = 0;		// 当前空洞段数（快照）
 	long long holeBytes = 0;	// 当前空洞总字节（快照，含 86B 头）
+	long long holeUseCnt = 0;	// 空洞复用次数（写入已有洞段，未追加）
 };
 
 class Disk {
@@ -91,6 +92,7 @@ private:
 	std::atomic<long long> statOverwriteShrink{ 0 };
 	std::atomic<long long> statHoleCnt{ 0 };	// 当前空洞段数（快照用）
 	std::atomic<long long> statHoleBytes{ 0 };	// 当前空洞总字节（快照用，含 86B 头）
+	std::atomic<long long> statHoleUseCnt{ 0 };	// 空洞复用次数（累计）
 
 	// ===== 空洞（删除=空洞，见 空洞删除段设计.md）=====
 	// 空闲段索引：按容量升序 (容量=86+dataSize, 偏移)，best-fit 取用；仅磁盘线程读写
@@ -107,6 +109,9 @@ private:
 	// 原位覆盖：已有旧记录且新记录放得下旧槽（含写剩余洞头）→ 覆盖返回 true（不追加、不增长）；
 	// 否则返回 false（回退追加）。调用前提：recBuf 已组装好
 	bool tryOverwriteInPlace(const std::string& varName);
+	// 空洞复用：从 holes 取 ≥ 新长的最小洞（best-fit）写入 → 返回 true（不追加、不增长）；
+	// 无可用洞返回 false（回退追加）。剩余 ≥86 再切洞登记
+	bool tryUseHole(const std::string& varName);
 	// 登记一个空洞段（容量=86+dataSize，偏移=offset）：写入 holes 并更新观测
 	void addHole(long long offset, long long capacity);
 	// 清除空洞索引（压缩成功/启动重建后：紧凑文件无洞）
