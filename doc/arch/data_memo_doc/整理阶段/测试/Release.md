@@ -160,3 +160,105 @@
 ================== END, total 30s ==================
 ```
 
+## 新优化
+
+```
+================== START (performance benchmark) ==================
+[prewarm [1] QPS - read-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [1] QPS - read-only (duration 30s) =====
+  requests: 28843832 | QPS 961461
+  latency(us): mean 8 | P50 6 | P99 36 | P999 136
+  cache: hit 28843832 / miss 0 -> hit rate 100%
+  evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+[prewarm [2] QPS - read70/write30] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [2] QPS - read70/write30 (duration 30s) =====
+  requests: 880989 | QPS 29366
+  latency(us): mean 272 | P50 10 | P99 4447 | P999 40802
+  cache: hit 574105 / miss 43121 -> hit rate 93.0137%
+  evict: 1046 calls / 20730 items / avg 0.0928929 ms per call / evict-ratio 0.323887%
+[prewarm [3] QPS - write-only] pool 338 keys, 95 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== [3] QPS - write-only (duration 30s) =====
+  requests: 203621 | QPS 6787
+  latency(us): mean 1179 | P50 20 | P99 32538 | P999 95973
+  cache: hit 0 / miss 0 -> hit rate 0%
+  evict: 1140 calls / 8875 items / avg 0.0826632 ms per call / evict-ratio 0.31412%
+[prewarm hit-rate 2x] 1015 keys, 200 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 2x (total 200 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 20046231 | QPS 668207
+  latency(us): mean 11 | P50 3 | P99 95 | P999 159
+  cache: hit 18224534 / miss 1821697 -> hit rate 90.9125%
+  evict: 212 calls / 6748 items / avg 0.133915 ms per call / evict-ratio 0.0946333%
+[prewarm hit-rate 3x] 1560 keys, 300 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 3x (total 300 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 12266683 | QPS 408889
+  latency(us): mean 19 | P50 4 | P99 90 | P999 231
+  cache: hit 10079990 / miss 2186693 -> hit rate 82.1737%
+  evict: 219 calls / 9676 items / avg 0.136333 ms per call / evict-ratio 0.0995233%
+[prewarm hit-rate 4x] 2084 keys, 400 MB, writing & flushing to disk...
+[prewarm done] load running for 30s
+===== hit-rate 4x (total 400 MB, log-normal 1K-10M) (duration 30s) =====
+  requests: 6862999 | QPS 228766
+  latency(us): mean 34 | P50 9 | P99 113 | P999 1007
+  cache: hit 4798792 / miss 2064207 -> hit rate 69.9227%
+  evict: 236 calls / 10098 items / avg 0.155669 ms per call / evict-ratio 0.12246%
+================== END, total 183s ==================
+```
+
+- **当缓存充足，在正常业务下（淘汰少），上面的是极端情况（刚开始缓存就满了）**
+
+  ```
+  ================== START (performance benchmark) ==================
+  [prewarm [1] QPS - read-only] pool 338 keys, 95 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== [1] QPS - read-only (duration 30s) =====
+    requests: 30147769 | QPS 1004925
+    latency(us): mean 7 | P50 5 | P99 32 | P999 119
+    cache: hit 30147769 / miss 0 -> hit rate 100%
+    evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+  [prewarm [2] QPS - read80/write20] pool 338 keys, 95 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== [2] QPS - read80/write20 (duration 30s) =====
+    requests: 3267474 | QPS 108915
+    latency(us): mean 73 | P50 9 | P99 2064 | P999 4935
+    cache: hit 2287566 / miss 0 -> hit rate 100%
+    evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+  [prewarm [3] QPS - write-only] pool 338 keys, 95 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== [3] QPS - write-only (duration 30s) =====
+    requests: 1049142 | QPS 34971
+    latency(us): mean 228 | P50 18 | P99 4353 | P999 5581
+    cache: hit 0 / miss 0 -> hit rate 0%
+    evict: 0 calls / 0 items / avg 0 ms per call / evict-ratio 0%
+  [prewarm hit-rate 2x] 10573 keys, 2000 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== hit-rate 2x (total 2000 MB, log-normal 1K-10M) (duration 30s) =====
+    requests: 1166859 | QPS 38895
+    latency(us): mean 205 | P50 9 | P99 3675 | P999 6564
+    cache: hit 1048439 / miss 118420 -> hit rate 89.8514%
+    evict: 302 calls / 122853 items / avg 3.2827 ms per call / evict-ratio 3.30458%
+  [prewarm hit-rate 3x] 15990 keys, 3000 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== hit-rate 3x (total 3000 MB, log-normal 1K-10M) (duration 30s) =====
+    requests: 1358661 | QPS 45288
+    latency(us): mean 176 | P50 9 | P99 2848 | P999 6771
+    cache: hit 1123490 / miss 235171 -> hit rate 82.691%
+    evict: 278 calls / 112668 items / avg 3.27393 ms per call / evict-ratio 3.03384%
+  [prewarm hit-rate 4x] 21183 keys, 4000 MB, writing & flushing to disk...
+  [prewarm done] load running for 30s
+  ===== hit-rate 4x (total 4000 MB, log-normal 1K-10M) (duration 30s) =====
+    requests: 1267124 | QPS 42237
+    latency(us): mean 189 | P50 9 | P99 2918 | P999 6084
+    cache: hit 971999 / miss 295125 -> hit rate 76.7091%
+    evict: 259 calls / 96826 items / avg 4.14144 ms per call / evict-ratio 3.57545%
+  ================== END, total 192s ==================
+  
+  
+  这也符合正常的业务了，所以应该算是够了
+  ```
+
+  

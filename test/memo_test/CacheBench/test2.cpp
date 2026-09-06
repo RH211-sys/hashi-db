@@ -45,11 +45,11 @@
 
 // ============ 配置 ============
 
-constexpr long long MEMO_SIZE = 1000LL * 1024 * 1024;	// 缓存 1000M（超限触发全局采样淘汰）
+constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（超限触发全局采样淘汰）
 constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M（命中率档最大 4x = 400M 数据需落盘）
 constexpr int POOL_THREADS = 4;							// 读线程池线程数
 const std::string DB_NAME = "test2_data.dat";			// 数据库文件
-constexpr long long WARM_BYTES = 95LL * 1024 * 1024;	// QPS 档预热池 95M（接近缓存上限但预热不触发淘汰；写波动即超限）
+constexpr long long WARM_BYTES = 1LL * 1024 * 1024;	// QPS 档预热池 1M（接近缓存上限但预热不触发淘汰；写波动即超限）
 constexpr double RUN_SECONDS = 30.0;					// 每场景固定时长
 constexpr int WORKERS = 8;								// 压测线程数（读池 4 线程 + 写线程 1，8 个发起者足够压满）
 constexpr int INJECT_MS = 30;							// 注入线程 add 间隔（约 33 条/s，30s 内磁盘余量内）
@@ -356,9 +356,9 @@ int main() {
 	qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
-	hitRateScene(2);
-	hitRateScene(3);
-	hitRateScene(4);
+	//hitRateScene(2);
+	//hitRateScene(3);
+	//hitRateScene(4);
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
 	double totalSec = std::chrono::duration<double>(
