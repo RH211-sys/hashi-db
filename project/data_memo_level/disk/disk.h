@@ -35,16 +35,19 @@ struct DiskIoStat {
 	long long selFailType = 0;	// 类型未注册
 	long long selFailOpen = 0;	// 文件打开失败
 	long long selOk = 0;		// 读盘成功（与 readCnt 同义，单独计数便于核对）
+	long long compactCnt = 0;	// 自动压缩（容量超限触发的 reWrite）次数
+	long long compactFail = 0;	// 自动压缩失败次数（失败会留下陈旧偏移 → 读失败来源）
 };
 
 class Disk {
 	friend class Cache;
 private:
 	std::weak_ptr<Cache> cache;	// 缓存对象指针，用weak防止内存泄露
-	long long maxSize;		// 磁盘最大容量
-	long long curSize;		// 磁盘当前容量
+	long long maxSize;		// 磁盘容量上限（写路径强制执行：追加将超限时先自动压缩 reWrite 回收空洞，
+							//   压缩后仍放不下则返回 MEMO_OUT；0 表示不设限）
+	long long curSize;		// 磁盘当前容量（文件实际大小：追加增长，压缩后重置为紧凑长度）
 	std::string dbName;		// 数据库名称(文件名)
-	std::unordered_map<std::string, int> inDisk;		// 变量名 + 偏移量
+	std::unordered_map<std::string, long long> inDisk;	// 变量名 + 记录偏移（64 位：数据文件可超 2GB）
 
 	// ===== 磁盘 IO（仅磁盘线程访问，天然串行，无需锁）=====
 	std::fstream file;			// 常驻文件句柄（读+写：所有持久化/重写复用，免每次 open/close）
@@ -69,6 +72,8 @@ private:
 	std::atomic<long long> statSelFailType{ 0 };
 	std::atomic<long long> statSelFailOpen{ 0 };
 	std::atomic<long long> statSelOk{ 0 };
+	std::atomic<long long> statCompactCnt{ 0 };
+	std::atomic<long long> statCompactFail{ 0 };
 
 	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
 	bool ensureFileOpen();

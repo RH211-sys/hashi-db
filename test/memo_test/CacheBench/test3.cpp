@@ -336,6 +336,7 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 	double busyRatio = q.busyUs > 0 ? 100.0 * (q.busyUs / 1000.0) / runMs : 0.0;
 	std::cout << "  disk-queue: depth avg " << q.avgDepth << " / max " << q.maxDepth
 		<< " | worker busy " << (q.busyUs / 1000) << " ms = " << busyRatio << "% (" << q.runCnt << " tasks)" << std::endl;
+	std::cout << "  disk-compact: " << io.compactCnt << " runs / fail " << io.compactFail << std::endl;
 }
 
 // ============ 场景 ============
