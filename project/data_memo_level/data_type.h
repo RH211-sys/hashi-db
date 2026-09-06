@@ -11,6 +11,8 @@
 #include <chrono>
 #include <atomic>
 #include <ostream>
+#include <istream>
+#include <streambuf>
 #include <sstream>
 #include <memory>
 #include "protocol.h"
@@ -43,11 +45,43 @@ void toBytes(const std::any& obj, std::ostream& os) {
     ar(std::any_cast<const T&>(obj));
 }
 
-// 反序列化：从字节还原对象，包进 any
+namespace detail {
+	// 只读内存流缓冲：让 cereal 直接在既有字节区上解析（零拷贝，
+	// 替代 stringstream+string 的两轮整块拷贝——大实体读回时省两次 ~MB 级 memcpy）
+	class MemInBuf : public std::streambuf {
+	public:
+		MemInBuf(const char* data, std::size_t size) {
+			char* p = const_cast<char*>(data);	// 只读使用，不改内容
+			setg(p, p, p + size);
+		}
+	protected:
+		pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
+			if (!(which & std::ios_base::in)) return pos_type(off_type(-1));
+			char* b = eback();
+			char* e = egptr();
+			char* cur = gptr();
+			switch (dir) {
+				case std::ios_base::beg: cur = b + off; break;
+				case std::ios_base::cur: cur = cur + off; break;
+				case std::ios_base::end: cur = e + off; break;
+				default: return pos_type(off_type(-1));
+			}
+			if (cur < b || cur > e) return pos_type(off_type(-1));
+			setg(b, cur, e);
+			return cur - b;
+		}
+		pos_type seekpos(pos_type pos, std::ios_base::openmode which) override {
+			return seekoff(static_cast<off_type>(pos), std::ios_base::beg, which);
+		}
+	};
+}
+
+// 反序列化：直接从读出的字节区解析还原对象，包进 any（零中间拷贝）
 template <typename T>
 std::any fromBytes(const std::vector<char>& bytes) {
-    std::stringstream ss(std::string(bytes.begin(), bytes.end()));
-    cereal::BinaryInputArchive ar(ss);
+    detail::MemInBuf buf(bytes.data(), bytes.size());
+    std::istream is(&buf);
+    cereal::BinaryInputArchive ar(is);
     T obj;
     ar(obj);
     return obj;

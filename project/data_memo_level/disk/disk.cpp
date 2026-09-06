@@ -510,9 +510,8 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     // 读耗时观测起点（含文件开关 + 读记录 + 反序列化，成功读回才记账）
     auto t0 = std::chrono::steady_clock::now();
 
-    /* ========== 打开文件读取 =========== */
-    std::ifstream file(dbName, std::ios::binary);
-    if (!file) {
+    /* ========== 打开文件读取（复用常驻读写句柄，免每次 open/close） =========== */
+    if (!ensureFileOpen()) {
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailOpen.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "open", varName, offset, -1, -1);	// 文件打开失败
