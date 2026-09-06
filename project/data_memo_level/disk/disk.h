@@ -41,7 +41,9 @@ struct DiskIoStat {
 	long long compactUs = 0;	// 压缩总耗时（µs；只统计成功完成的压缩）
 	long long compactBefore = 0;// 压缩前文件逻辑大小累计（字节；用于算空洞回收量）
 	long long compactAfter = 0;	// 压缩后文件大小累计（字节 = 各次 writePos 之和）
-	long long overwriteCnt = 0;	// 原位覆盖写次数（更新放得下旧槽时覆盖，未追加）
+	long long overwriteCnt = 0;	// 原位覆盖写总次数（放得下旧槽时覆盖，未追加）
+	long long overwriteSame = 0;	// 覆盖且等长（剩余=0，不产生洞）
+	long long overwriteShrink = 0;	// 覆盖且缩小（剩余≥86，登记剩余洞）
 	long long holeCnt = 0;		// 当前空洞段数（快照）
 	long long holeBytes = 0;	// 当前空洞总字节（快照，含 86B 头）
 };
@@ -85,6 +87,8 @@ private:
 	std::atomic<long long> statCompactBefore{ 0 };
 	std::atomic<long long> statCompactAfter{ 0 };
 	std::atomic<long long> statOverwriteCnt{ 0 };
+	std::atomic<long long> statOverwriteSame{ 0 };
+	std::atomic<long long> statOverwriteShrink{ 0 };
 	std::atomic<long long> statHoleCnt{ 0 };	// 当前空洞段数（快照用）
 	std::atomic<long long> statHoleBytes{ 0 };	// 当前空洞总字节（快照用，含 86B 头）
 

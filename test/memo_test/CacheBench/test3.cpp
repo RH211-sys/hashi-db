@@ -345,8 +345,9 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 		<< " ms | flush " << (io.flushUs / 1000) << " ms (" << io.flushCnt << " calls)" << std::endl;
 	std::cout << "    per-write avg: build " << (io.writeCnt ? io.buildUs / io.writeCnt : 0)
 		<< " us | file " << (io.writeCnt ? io.fileUs / io.writeCnt : 0) << " us" << std::endl;
-	std::cout << "  disk-ovw/holes: overwrite " << io.overwriteCnt << " | holes " << io.holeCnt
-		<< " segs / " << (io.holeBytes / 1024 / 1024) << " MB" << std::endl;
+	std::cout << "  disk-ovw/holes: overwrite " << io.overwriteCnt
+		<< " (same " << io.overwriteSame << " / shrink " << io.overwriteShrink << ")"
+		<< " | holes " << io.holeCnt << " segs / " << (io.holeBytes / 1024 / 1024) << " MB" << std::endl;
 	std::cout << "  disk-read: " << io.readCnt << " reads / " << (io.readUs / 1000) << " ms"
 		<< " (avg " << (io.readCnt ? io.readUs / io.readCnt : 0) << " us)" << std::endl;
 	double inDiskMissRatio = io.selCalls > 0 ? 100.0 * io.selInDiskMiss / io.selCalls : 0.0;
@@ -431,7 +432,7 @@ int main() {
 	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
-	hitRateScene(2);
+	// hitRateScene(2);
 	// hitRateScene(3);
 	//hitRateScene(4);	// 4x=400M（≈1:4:5）可选对照；跑全量会明显增加预热时长与 SSD 写入
 

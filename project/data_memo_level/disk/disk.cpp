@@ -290,6 +290,8 @@ bool Disk::tryOverwriteInPlace(const std::string& varName)
         std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);
     statWriteCnt.fetch_add(1, std::memory_order_relaxed);
     statOverwriteCnt.fetch_add(1, std::memory_order_relaxed);
+    if (remain == 0) statOverwriteSame.fetch_add(1, std::memory_order_relaxed);
+    else statOverwriteShrink.fetch_add(1, std::memory_order_relaxed);
     return true;	// inDisk/curSize 不变；flush 由调用方批处理
 }
 
@@ -320,6 +322,8 @@ DiskIoStat Disk::getIoStat() const
     s.compactBefore = statCompactBefore.load(std::memory_order_relaxed);
     s.compactAfter = statCompactAfter.load(std::memory_order_relaxed);
     s.overwriteCnt = statOverwriteCnt.load(std::memory_order_relaxed);
+    s.overwriteSame = statOverwriteSame.load(std::memory_order_relaxed);
+    s.overwriteShrink = statOverwriteShrink.load(std::memory_order_relaxed);
     s.holeCnt = statHoleCnt.load(std::memory_order_relaxed);
     s.holeBytes = statHoleBytes.load(std::memory_order_relaxed);
     return s;
