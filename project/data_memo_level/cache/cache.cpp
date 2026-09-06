@@ -15,10 +15,11 @@ Cache::Cache(const long long memoSize, const int batchSize, const int upDisEdge,
 /* =============== private =============== */
 
 double Cache::evictScore(Val& val) {
-	auto now = std::chrono::system_clock::now();
-	// 距上次写入间隔（微秒），下限取 1：只用于查档位，不取对数，无 log(0) 问题
-	// updateTime 只在写操作/回填等写路径更新，读命中不刷新（命中路径纯读零写）
-	long long intervalUs = std::chrono::duration_cast<std::chrono::microseconds>(now - val.updateTime).count();
+	// 距上次"读命中/插入"间隔（µs）：下限取 1，只用于查档位，不取对数，无 log(0) 问题
+	// updateTime = 最近读命中时刻（relaxed 原子）：读命中刷新（store）；modData 命中不刷新（写可能是冷数据）；
+	// addData 置 now、磁盘回填沿用磁盘记录旧时间、modData 回填保持默认 0（视为最冷）
+	long long intervalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count() - val.updateTime.load(std::memory_order_relaxed);
 	if (intervalUs < 1) intervalUs = 1;
 
 	// 时间档位（静态常量表）：<1min / <1h / <1d / <7d / ≥7d
@@ -217,14 +218,18 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 					expired = !it->second.isPermanent && it->second.expireTime <= std::chrono::system_clock::now();
 					if (!expired) {
 						entity = it->second.entity;	// 与缓存共享同一实体指针
-						it->second.updateTime = std::chrono::system_clock::now();  // 更新时间
+						// 读命中刷新热度（relaxed 原子 store：消除共享锁内多读者并发写同一字段的竞争）
+						it->second.updateTime.store(
+							std::chrono::duration_cast<std::chrono::microseconds>(
+								std::chrono::system_clock::now().time_since_epoch()).count(),
+							std::memory_order_relaxed);
 					}
 				}
 				rwMutex->unlock_shared();
 			}
 
 			if (inCache && !expired) {
-				// 命中未过期：直接兑现（不刷新时间/顺序信息，命中路径唯一的原子写 = 统计自增）
+				// 命中未过期：直接兑现（刷新 updateTime 为 relaxed 原子写，无其它锁内写）
 				statHit.fetch_add(1, std::memory_order_relaxed);	// 命中统计
 				ar.done(SelResult{ SUCCESS, std::move(entity) });
 				return;
@@ -272,7 +277,7 @@ std::future<SelResult> Cache::selData(const std::string& varName)
 						rwMutex->lock();	// 回填是写操作，独占锁
 						if (!cache_db.contains(varName)) {	// 锁内重校验：排队期间可能已并发插入，存在则跳过
 							val.isDirty = false;	// 磁盘读回的数据是干净的
-							// val.updateTime = std::chrono::system_clock::now();	// 回填视为一次写入访问（写路径才更新）
+							// updateTime 不置 now：沿用磁盘记录里的旧时间（回填不保活，热度靠后续读命中刷新）
 							long long dataSize = val.dataSize;	// move 前先取大小
 							cache_db.emplace(varName, std::move(val));	// 移动进缓存，实体指针零拷贝
 							curSize += dataSize;			// 更新缓存当前大小

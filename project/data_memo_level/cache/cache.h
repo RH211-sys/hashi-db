@@ -16,6 +16,7 @@
 /*
 	缓存运行统计快照（供性能测试与运行观测）：命中/未命中/淘汰计数与耗时
 	计数为原子累加值，读取瞬间的一致性要求不高（观测用途）
+	命中/未命中在热路径 relaxed 自增；evict 只在写线程执行，原子累加无争抢
 */
 struct CacheStat {
 	long long hit = 0;			// 命中次数：缓存中存在即算命中（含已过期——过期是 TTL 语义，不算缓存未命中）
@@ -84,7 +85,7 @@ private:
 	std::atomic<long long> statEvictItems{ 0 };	// 淘汰条目数（过期清理 + 采样淘汰）
 	std::atomic<long long> statEvictUs{ 0 };	// 淘汰总耗时（微秒）
 private:
-	// 淘汰分数计算：距上次写入的时间档位 × 档距 + ln(大小)，分数越高越优先淘汰
+	// 淘汰分数计算：距上次读命中/插入的档位 × 档距 + ln(大小)，分数越高越优先淘汰
 	double evictScore(Val& val);
 	// 全局采样淘汰（无 LRU 链表）：随机桶采样(unordered_map的桶) + 优先队列，阻塞执行到容量达标（写线程内调用）
 	void evict();
@@ -124,9 +125,11 @@ public:
 				Val v;
 				v.typeName = T::getClassName();	// 类型名称
 				v.isPermanent = isPermanent;	// 是否永不过期
-				v.updateTime = std::chrono::system_clock::now();
+				long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::system_clock::now().time_since_epoch()).count();	// µs since epoch
+				v.updateTime.store(nowUs, std::memory_order_relaxed);	// 插入即"最近访问"= now
 				if (!isPermanent) {
-					v.expireTime = v.updateTime + during;	// 非永久：过期时间 = 更新时间 + 持续时间
+					v.expireTime = std::chrono::system_clock::time_point(std::chrono::microseconds(nowUs)) + during;	// 非永久：过期时间 = 更新时间 + 持续时间
 				}
 				v.isDirty = true;				// 新数据标记为脏，等待刷盘
 				v.dataSize = THE_SIZE(T, entity);	// 数据大小（用户自定义 theSize 计算）

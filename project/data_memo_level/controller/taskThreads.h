@@ -2,6 +2,7 @@
 #ifndef _TASK_THREADS_H_
 #define _TASK_THREADS_H_
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -227,6 +228,15 @@ public:
 const int DISK_TASK = 1;	// 磁盘任务
 const int CACHE_TASK = 2;	// 缓存任务
 
+// 磁盘线程观测快照（供性能归因，非功能）：提交量 / 队列积压 / worker 忙碌
+struct DiskQueueStat {
+	long long pushCnt = 0;		// 提交（push/submit）次数
+	double avgDepth = 0;		// 提交时双队列合计平均深度
+	long long maxDepth = 0;		// 提交时队列深度峰值
+	long long runCnt = 0;		// worker 已执行任务数
+	long long busyUs = 0;		// worker 执行任务总耗时（µs）
+};
+
 /*
 	磁盘线程：单线程串行执行磁盘 IO 任务（持久化/刷盘/重写/删除）
 	缓存调用后异步操作：提交任务立即返回，调用者不等待
@@ -246,6 +256,20 @@ private:
 	int upEdge = 15;			// 差距上限：缓存任务堆积到上限时，若有磁盘任务则让位调度一个
 	int lowEdge = -5;			// 差距下限：磁盘任务处理过多时，重置差距
 	bool stop = false;								// 停止标志（析构时置位）
+	// 观测统计（relaxed，供性能归因）：队列积压与 worker 忙碌占比
+	std::atomic<long long> statPushCnt{ 0 };	// 提交（push/submit）次数
+	std::atomic<long long> statDepthSum{ 0 };	// 提交时双队列总深度累加
+	std::atomic<long long> statDepthMax{ 0 };	// 提交时队列深度峰值
+	std::atomic<long long> statRunCnt{ 0 };		// worker 已执行任务数
+	std::atomic<long long> statBusyUs{ 0 };		// worker 执行任务总耗时（µs）
+	// 提交观测记账（须持锁调用：队列 size 读安全）：push 次数 / 深度累加 / 峰值
+	void notePush() {
+		statPushCnt.fetch_add(1, std::memory_order_relaxed);
+		long long depth = static_cast<long long>(diskTasks.size() + cacheTasks.size());
+		statDepthSum.fetch_add(depth, std::memory_order_relaxed);
+		long long maxD = statDepthMax.load(std::memory_order_relaxed);
+		if (depth > maxD) statDepthMax.store(depth, std::memory_order_relaxed);
+	}
 
 	// 线程入口：取任务 -> 执行回调 -> 继续取，直到停止且队列清空
 	void work() {
@@ -278,12 +302,18 @@ private:
 					continue;	// 理论不可达：wait 已保证队列非空
 				}
 			}
+			auto runT0 = std::chrono::steady_clock::now();	// worker 执行耗时观测起点
 			try {
 				task();	// 锁外执行回调，磁盘 IO 全程锁外
 			}
 			catch (...) {
 				// 磁盘任务异常不致命：吞掉继续干活，避免磁盘线程死亡
 			}
+			statBusyUs.fetch_add(static_cast<long long>(
+				std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - runT0).count()),
+				std::memory_order_relaxed);
+			statRunCnt.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 
@@ -320,6 +350,7 @@ public:
 			else if (taskType == CACHE_TASK) {
 				cacheTasks.push(std::move(task));	// 默认按缓存任务处理
 			}
+			notePush();	// 观测：提交时队列深度
 		}
 		cv.notify_one();
 	}
@@ -346,9 +377,22 @@ public:
 			else if (taskType == CACHE_TASK) {
 				cacheTasks.push([ptask]() { (*ptask)(); });	// 默认按缓存任务处理
 			}
+			notePush();	// 观测：提交时队列深度
 		}
 		cv.notify_one();
 		return fut;
+	}
+
+	// 观测快照：提交次数 / 平均与峰值队列深度 / worker 执行任务数与总耗时
+	DiskQueueStat getQueueStat() const {
+		DiskQueueStat s;
+		s.pushCnt = statPushCnt.load(std::memory_order_relaxed);
+		s.maxDepth = statDepthMax.load(std::memory_order_relaxed);
+		s.avgDepth = (s.pushCnt > 0)
+			? static_cast<double>(statDepthSum.load(std::memory_order_relaxed)) / s.pushCnt : 0.0;
+		s.runCnt = statRunCnt.load(std::memory_order_relaxed);
+		s.busyUs = statBusyUs.load(std::memory_order_relaxed);
+		return s;
 	}
 };
 

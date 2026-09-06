@@ -107,6 +107,20 @@ public:
 		返回值：CacheStat（各字段含义见 cache.h 顶部结构体定义）
 	*/
 	CacheStat getStat() const;
+
+	/*
+		功能：读取磁盘 IO 阶段统计（组装序列化 / 文件写 / flush / 磁盘读，供性能归因）
+		参数：无
+		返回值：DiskIoStat（字段含义见 disk.h 结构体定义）
+	*/
+	DiskIoStat getIoStat() const;
+
+	/*
+		功能：读取磁盘线程队列统计（提交量 / 队列积压 / worker 忙碌，供性能归因）
+		参数：无
+		返回值：DiskQueueStat（字段含义见 taskThreads.h 结构体定义）
+	*/
+	DiskQueueStat getQueueStat() const;
 };
 
 #endif

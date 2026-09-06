@@ -55,3 +55,15 @@ CacheStat Controller::getStat() const
 	// 统计快照读自缓存模块（原子计数），直接透传
 	return cache->getStat();
 }
+
+DiskIoStat Controller::getIoStat() const
+{
+	// 磁盘 IO 阶段统计：透传磁盘模块
+	return disk->getIoStat();
+}
+
+DiskQueueStat Controller::getQueueStat() const
+{
+	// 磁盘线程队列/忙碌统计：透传磁盘线程
+	return diskThread->getQueueStat();
+}
