@@ -150,6 +150,9 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     int code = buildRecord(varName, val, CHECK_BROKEN, dataSize);
     if (code != SUCCESS) return code;
 
+    // 原位覆盖优先：该 key 已有磁盘记录且新记录放得下旧槽 → 覆盖写（不追加、不增长、不触发容量压缩）
+    if (tryOverwriteInPlace(varName)) return SUCCESS;
+
     // 容量执行（磁盘上限 = 配置的 maxSize，由业务侧设置）：
     // 追加后超过上限 → 先同线程压缩（reWrite 回收空洞并截断），压缩后仍放不下才拒绝(MEMO_OUT)
     // 注1：reWrite 会复用 recBuf，故压缩后需重建本记录
@@ -203,14 +206,91 @@ void Disk::flushSync()
     statFlushCnt.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Disk::addHole(long long offset, long long capacity)
+{
+    // 登记空闲段（仅磁盘线程调用）；容量 = 86 + dataSize，best-fit 取用
+    holes.emplace(capacity, offset);
+    statHoleCnt.fetch_add(1, std::memory_order_relaxed);
+    statHoleBytes.fetch_add(capacity, std::memory_order_relaxed);
+}
+
+void Disk::clearHoles()
+{
+    // 压缩成功/重建后：紧凑文件无洞
+    if (!holes.empty()) holes.clear();
+    statHoleCnt.store(0, std::memory_order_relaxed);
+    statHoleBytes.store(0, std::memory_order_relaxed);
+}
+
 void Disk::markDeleted(long long offset)
 {
-    // 已删/空洞标记（1 字节 CHECK_DELETED）：旧头 dataSize 原样保留 → 顺序扫描可跳过、段可复用
+    // 已删/空洞标记（1 字节 CHECK_DELETED）+ 登记空洞：旧头 dataSize 保留 → 可跳读/复用
     if (!ensureFileOpen()) return;
+    file.seekg(offset);
+    char oldCheck = 0;
+    int oldDataSize = 0;
+    file.read(&oldCheck, CODE_LEN);
+    file.read((char*)&oldDataSize, ENTITY_SIZE_LEN);
+    if (!file || oldCheck != CHECK_VALID) { file.clear(); return; }	// 异常/已删：不重复登记
     file.seekp(offset);
     char code = CHECK_DELETED;
     file.write(&code, CODE_LEN);
-    if (!file) file.clear();	// 标记失败：逻辑删除仍生效（inDisk 已擦除）；loader 阶段按文件为准处理
+    if (!file) { file.clear(); return; }	// 标记失败：逻辑删除仍生效（inDisk 已擦除）；loader 阶段按文件为准
+    addHole(offset, static_cast<long long>(HEAD_SIZE) + oldDataSize);
+}
+
+bool Disk::tryOverwriteInPlace(const std::string& varName)
+{
+    // 原位覆盖（前提：recBuf 已组装）：
+    //   inDisk 有旧记录且新记录总长 ≤ 旧槽总长，且（等长 或 剩余 ≥ 一个洞头）→ 覆盖写（+剩余区洞头）
+    //   返回 true：不追加、文件不增长、inDisk 偏移不变、无需容量检查
+    auto it = inDisk.find(varName);
+    if (it == inDisk.end()) return false;
+    long long oldOff = it->second;
+    long long newTotal = static_cast<long long>(recBuf.size());
+    if (!ensureFileOpen()) return false;
+
+    // 读旧头：VALID 校验 + 旧 dataSize（决定旧槽容量）
+    file.seekg(oldOff);
+    char oldCheck = 0;
+    int oldDataSize = 0;
+    file.read(&oldCheck, CODE_LEN);
+    file.read((char*)&oldDataSize, ENTITY_SIZE_LEN);
+    if (!file || oldCheck != CHECK_VALID) { file.clear(); return false; }
+    long long oldTotal = static_cast<long long>(HEAD_SIZE) + oldDataSize;
+    if (newTotal > oldTotal) return false;					// 放不下 → 回退追加
+    long long remain = oldTotal - newTotal;
+    if (remain != 0 && remain < HEAD_SIZE) return false;	// 剩余不足一个洞头：链会断 → 回退追加
+
+    auto t1 = std::chrono::steady_clock::now();
+    // 两段式覆盖：recBuf 头为 BROKEN → 整条写 → 回写 VALID
+    file.seekp(oldOff);
+    file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
+    file.seekp(oldOff);
+    char valid = CHECK_VALID;
+    file.write(&valid, CODE_LEN);
+    if (remain >= HEAD_SIZE) {
+        // 剩余区写洞头：code=DELETED + dataSize=剩余容量-头（其余头字段不填，跳读只用 code+size）
+        long long holeDataSize = remain - HEAD_SIZE;
+        file.seekp(oldOff + newTotal);
+        char del = CHECK_DELETED;
+        file.write(&del, CODE_LEN);
+        int sz = static_cast<int>(holeDataSize);
+        file.write((char*)&sz, ENTITY_SIZE_LEN);
+    }
+    if (!file) {
+        // 覆盖失败：恢复旧校验码，保持文件可解析（被覆盖内容不再被引用）
+        file.clear();
+        file.seekp(oldOff);
+        file.write(&oldCheck, CODE_LEN);
+        return false;
+    }
+    if (remain >= HEAD_SIZE) addHole(oldOff + newTotal, remain);	// 登记剩余洞
+    statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);
+    statWriteCnt.fetch_add(1, std::memory_order_relaxed);
+    statOverwriteCnt.fetch_add(1, std::memory_order_relaxed);
+    return true;	// inDisk/curSize 不变；flush 由调用方批处理
 }
 
 DiskIoStat Disk::getIoStat() const
@@ -239,6 +319,9 @@ DiskIoStat Disk::getIoStat() const
     s.compactUs = statCompactUs.load(std::memory_order_relaxed);
     s.compactBefore = statCompactBefore.load(std::memory_order_relaxed);
     s.compactAfter = statCompactAfter.load(std::memory_order_relaxed);
+    s.overwriteCnt = statOverwriteCnt.load(std::memory_order_relaxed);
+    s.holeCnt = statHoleCnt.load(std::memory_order_relaxed);
+    s.holeBytes = statHoleBytes.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -697,9 +780,10 @@ int Disk::flushDisk()
     if (!c) return UNKNOWN_ERROR;	// 缓存未绑定或已析构
 
     /*
-        1. 过期数据：缓存删除 + 磁盘索引删除（防止从磁盘复活，磁盘记录留空洞等重写回收）
+        1. 过期数据：缓存删除 + 磁盘索引删除 + 文件标记(删除=空洞，随 delData 登记)
         2. 未过期脏数据：收集变量名，锁外批量刷盘，防止锁堵住
     */
+    std::vector<std::string> expiredNames;
     std::vector<std::string> flushNames;
     {
         c->rwMutex->lock();
@@ -709,9 +793,9 @@ int Disk::flushDisk()
         while (it != c->cache_db.end()) {
             auto& val = it->second;
             if (!val.isPermanent && val.expireTime <= now) {
-                // 过期：直接删除（缓存权威，过期数据不落盘）
+                // 过期：直接删缓存（缓存权威，过期数据不落盘）；inDisk/文件标记由 delData 统一处理
                 c->curSize -= val.dataSize;	// 更新缓存当前大小
-                inDisk.erase(it->first);
+                expiredNames.emplace_back(it->first);
                 it = c->cache_db.erase(it);
             } else {
                 if (val.isDirty) flushNames.emplace_back(it->first);	// 未过期脏数据：收集刷盘
@@ -720,9 +804,11 @@ int Disk::flushDisk()
         }
         c->rwMutex->unlock();
     }
+    // 过期清理：擦 inDisk + 文件头删除标记 + 登记空洞（批内一次 flush）
+    if (!expiredNames.empty()) delData(std::move(expiredNames));
     /*
         复用persisData重载（一次文件开关，写前清 isDirty，失败统一置回）
-        inDisk 中已存在的数据：追加写后偏移覆盖为最新（逻辑覆盖），旧记录成空洞等重写回收
+        inDisk 中已存在的数据：追加/原位覆盖后偏移为最新，旧记录成空洞等重写回收
     */
     return persisData(std::move(flushNames));
 }
@@ -904,6 +990,7 @@ int Disk::reWrite()
     if (ec) { reportRewriteFail(dbName, "resize", "", -1); return UNKNOWN_ERROR; }	// 截断失败
 
     curSize = writePos;
+    clearHoles();	// 紧凑文件无洞：清空洞索引（此前登记的洞已被压缩回收）
     // —— 压缩观测记账（仅成功路径；失败由调用方 compactFail 计数）——
     statCompactUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - compactT0).count()), std::memory_order_relaxed);

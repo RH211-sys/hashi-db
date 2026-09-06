@@ -345,6 +345,8 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 		<< " ms | flush " << (io.flushUs / 1000) << " ms (" << io.flushCnt << " calls)" << std::endl;
 	std::cout << "    per-write avg: build " << (io.writeCnt ? io.buildUs / io.writeCnt : 0)
 		<< " us | file " << (io.writeCnt ? io.fileUs / io.writeCnt : 0) << " us" << std::endl;
+	std::cout << "  disk-ovw/holes: overwrite " << io.overwriteCnt << " | holes " << io.holeCnt
+		<< " segs / " << (io.holeBytes / 1024 / 1024) << " MB" << std::endl;
 	std::cout << "  disk-read: " << io.readCnt << " reads / " << (io.readUs / 1000) << " ms"
 		<< " (avg " << (io.readCnt ? io.readUs / io.readCnt : 0) << " us)" << std::endl;
 	double inDiskMissRatio = io.selCalls > 0 ? 100.0 * io.selInDiskMiss / io.selCalls : 0.0;

@@ -5,6 +5,7 @@
 #include "../data_type.h"
 #include <atomic>
 #include <fstream>
+#include <set>
 #include <utility>
 #include <vector>
 #include <list>
@@ -40,6 +41,9 @@ struct DiskIoStat {
 	long long compactUs = 0;	// 压缩总耗时（µs；只统计成功完成的压缩）
 	long long compactBefore = 0;// 压缩前文件逻辑大小累计（字节；用于算空洞回收量）
 	long long compactAfter = 0;	// 压缩后文件大小累计（字节 = 各次 writePos 之和）
+	long long overwriteCnt = 0;	// 原位覆盖写次数（更新放得下旧槽时覆盖，未追加）
+	long long holeCnt = 0;		// 当前空洞段数（快照）
+	long long holeBytes = 0;	// 当前空洞总字节（快照，含 86B 头）
 };
 
 class Disk {
@@ -80,6 +84,13 @@ private:
 	std::atomic<long long> statCompactUs{ 0 };
 	std::atomic<long long> statCompactBefore{ 0 };
 	std::atomic<long long> statCompactAfter{ 0 };
+	std::atomic<long long> statOverwriteCnt{ 0 };
+	std::atomic<long long> statHoleCnt{ 0 };	// 当前空洞段数（快照用）
+	std::atomic<long long> statHoleBytes{ 0 };	// 当前空洞总字节（快照用，含 86B 头）
+
+	// ===== 空洞（删除=空洞，见 空洞删除段设计.md）=====
+	// 空闲段索引：按容量升序 (容量=86+dataSize, 偏移)，best-fit 取用；仅磁盘线程读写
+	std::multiset<std::pair<long long, long long>> holes;
 
 	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
 	bool ensureFileOpen();
@@ -89,6 +100,13 @@ private:
 	// 追加写单条记录（两段式校验码：先整条 CHECK_BROKEN，写毕回写 CHECK_VALID）
 	// 不 flush（调用方按批 flush）；成功更新 inDisk/curSize
 	int appendRecord(const std::string& varName, const Val& val);
+	// 原位覆盖：已有旧记录且新记录放得下旧槽（含写剩余洞头）→ 覆盖返回 true（不追加、不增长）；
+	// 否则返回 false（回退追加）。调用前提：recBuf 已组装好
+	bool tryOverwriteInPlace(const std::string& varName);
+	// 登记一个空洞段（容量=86+dataSize，偏移=offset）：写入 holes 并更新观测
+	void addHole(long long offset, long long capacity);
+	// 清除空洞索引（压缩成功/启动重建后：紧凑文件无洞）
+	void clearHoles();
 	// flush 并记账（调用方各写路径共用）
 	void flushSync();
 	// 把某偏移处的记录标记为已删/空洞（写 1 字节 CHECK_DELETED，旧头 dataSize 保留→可跳读/复用）；
