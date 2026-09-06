@@ -203,6 +203,16 @@ void Disk::flushSync()
     statFlushCnt.fetch_add(1, std::memory_order_relaxed);
 }
 
+void Disk::markDeleted(long long offset)
+{
+    // 已删/空洞标记（1 字节 CHECK_DELETED）：旧头 dataSize 原样保留 → 顺序扫描可跳过、段可复用
+    if (!ensureFileOpen()) return;
+    file.seekp(offset);
+    char code = CHECK_DELETED;
+    file.write(&code, CODE_LEN);
+    if (!file) file.clear();	// 标记失败：逻辑删除仍生效（inDisk 已擦除）；loader 阶段按文件为准处理
+}
+
 DiskIoStat Disk::getIoStat() const
 {
     // 观测快照：relaxed 读即可（累加值，不强一致）
@@ -235,20 +245,32 @@ DiskIoStat Disk::getIoStat() const
 
 int Disk::delData(const std::string& varName)
 {
-    // 数据仍在文件里（inDisk 保留偏移），只标记逻辑删除，重写时跳过清理
-    if (inDisk.contains(varName)) {
-        inDisk.erase(varName);
-        return SUCCESS;
+    // 删除 = 空洞：擦 inDisk + 文件头 1 字节 CHECK_DELETED（dataSize 保留 → 可跳读/复用）
+    auto it = inDisk.find(varName);
+    if (it == inDisk.end()) {
+        return FIND_FAILED;	// 该数据不存在，可能已经被删除了
     }
-    // 该数据不存在，可能已经被删除了
-    return FIND_FAILED;
+    long long offset = it->second;
+    inDisk.erase(it);
+    markDeleted(offset);
+    if (file.is_open()) file.flush();	// 标记随任务落盘（不计入 flush 观测）
+    return SUCCESS;
 }
 
 int Disk::delData(std::vector<std::string> varNameSet)
 {
+    // 批量删除：逐条擦 inDisk + 文件头标记，结束时一次 flush
+    bool any = false;
     for (const auto& varName : varNameSet) {
-        inDisk.erase(varName);	// 不存在则无操作，不视为错误
+        auto it = inDisk.find(varName);
+        if (it != inDisk.end()) {
+            long long offset = it->second;
+            inDisk.erase(it);
+            markDeleted(offset);
+            any = true;
+        }	// 不存在则无操作，不视为错误
     }
+    if (any && file.is_open()) file.flush();	// 标记随任务落盘（不计入 flush 观测）
     return SUCCESS;
 }
 

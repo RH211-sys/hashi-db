@@ -91,6 +91,9 @@ private:
 	int appendRecord(const std::string& varName, const Val& val);
 	// flush 并记账（调用方各写路径共用）
 	void flushSync();
+	// 把某偏移处的记录标记为已删/空洞（写 1 字节 CHECK_DELETED，旧头 dataSize 保留→可跳读/复用）；
+	// 不负责 flush，由调用方随任务批 flush（见 空洞删除段设计.md §3.2）
+	void markDeleted(long long offset);
 
 public:
 	explicit Disk(const long long& maxSize, std::string& dbName);
