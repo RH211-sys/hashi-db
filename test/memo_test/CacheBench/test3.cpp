@@ -391,7 +391,25 @@ static void qpsScene(const char* title, double readRate) {
 		}
 	}
 
-	LoadResult r = runLoad(db, pool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
+	// 纯读档：1:3 数据集下"全量读"= 磁盘冷读（把磁盘线程打满、QPS 失真），
+	// 故纯读只打"热子集"（≤ 0.7×缓存字节，基本常驻缓存）→ 测内存命中读吞吐；
+	// 冷读/磁盘读行为交给 hit-rate 2x/3x 档覆盖
+	std::vector<PoolEntry> loadPool;
+	if (readRate >= 1.0) {
+		const long long hotLimit = MEMO_SIZE * 7 / 10;	// ~70MB < 缓存 100M
+		long long hotBytes = 0;
+		for (const auto& e : pool) {
+			if (hotBytes >= hotLimit) break;
+			loadPool.push_back(e);
+			hotBytes += e.size;
+		}
+		std::cout << "[read-only] hot subset " << loadPool.size() << " keys / "
+			<< (hotBytes / 1024 / 1024) << " MB (memory-hit reads; cold/disk reads -> hit-rate scenes)" << std::endl;
+	} else {
+		loadPool = pool;	// 含写场景：全数据集 300M + 缓慢注入
+	}
+
+	LoadResult r = runLoad(db, loadPool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
 	CacheStat s = db.getStat();
 	printLoad(title, r, s, RUN_SECONDS);
 	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
@@ -428,13 +446,13 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[2] QPS - read70/write30", 0.7);
-	// qpsScene("[1] QPS - read-only", 1.0);
-	// qpsScene("[3] QPS - write-only", 0.0);
+	//qpsScene("[2] QPS - read70/write30", 0.7);
+	qpsScene("[1] QPS - read-only", 1.0);		
+	//qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
-	// hitRateScene(2);
-	// hitRateScene(3);
+	//hitRateScene(2);
+	//hitRateScene(3);
 	//hitRateScene(4);	// 4x=400M（≈1:4:5）可选对照；跑全量会明显增加预热时长与 SSD 写入
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
