@@ -49,7 +49,7 @@ constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（超限触�
 constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M（命中率档最大 4x = 400M 数据需落盘）
 constexpr int POOL_THREADS = 4;							// 读线程池线程数
 const std::string DB_NAME = "test2_data.dat";			// 数据库文件
-constexpr long long WARM_BYTES = 1LL * 1024 * 1024;	// QPS 档预热池 1M（接近缓存上限但预热不触发淘汰；写波动即超限）
+constexpr long long WARM_BYTES = 95LL * 1024 * 1024;	// QPS 档预热池 95M（接近缓存上限但预热不触发淘汰；写波动即超限）
 constexpr double RUN_SECONDS = 30.0;					// 每场景固定时长
 constexpr int WORKERS = 8;								// 压测线程数（读池 4 线程 + 写线程 1，8 个发起者足够压满）
 constexpr int INJECT_MS = 30;							// 注入线程 add 间隔（约 33 条/s，30s 内磁盘余量内）
@@ -351,9 +351,9 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[1] QPS - read-only", 1.0);
-	qpsScene("[2] QPS - read80/write20", 0.7);
-	qpsScene("[3] QPS - write-only", 0.0);
+	 qpsScene("[1] QPS - read-only", 1.0);
+	 qpsScene("[2] QPS - read70/write30", 0.8);
+	 qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
 	//hitRateScene(2);
