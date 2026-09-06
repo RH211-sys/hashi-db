@@ -88,10 +88,13 @@ int Disk::buildRecord(const std::string& varName, const Val& val, char code, int
     // 定长头占位（全零 = 0x00，恰为 CHECK_BROKEN），实体字节随后直接序列化进同一缓冲
     recBuf.clear();
     recBuf.resize(HEAD_SIZE);
+    auto t0 = std::chrono::steady_clock::now();
     {
         VecStream os(recBuf);
         reg->second.first(*val.entity, os);	// 实体字节追加到 recBuf[HEAD_SIZE..]，零中间拷贝
     }
+    statBuildUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);	// 组装（序列化）耗时记账
     dataSize = static_cast<int>(recBuf.size() - HEAD_SIZE);	// 数据大小：只含实体
 
     // 时间信息（updateTime 已是 µs 整数；expireTime 仍为 time_point）
@@ -119,6 +122,7 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     if (code != SUCCESS) return code;
 
     // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
+    auto t1 = std::chrono::steady_clock::now();
     file.seekp(0, std::ios::end);
     std::streamoff offset = file.tellp();	// 记录偏移 = 文件当前大小
     if (!file) { file.clear(); return UNKNOWN_ERROR; }
@@ -129,11 +133,40 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     char valid = CHECK_VALID;
     file.write(&valid, CODE_LEN);
     if (!file) return UNKNOWN_ERROR;
+    statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);	// 文件写耗时记账
+    statWriteCnt.fetch_add(1, std::memory_order_relaxed);
+    statWriteBytes.fetch_add(static_cast<long long>(recBuf.size()), std::memory_order_relaxed);
 
     // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
     inDisk[varName] = static_cast<int>(offset);
     curSize += static_cast<long long>(recBuf.size());	// 只增不减：空洞/已删数据不回收，重写时重新统计
     return SUCCESS;
+}
+
+void Disk::flushSync()
+{
+    // flush 并记账（写路径共用：单条持久化/批量末尾/重写末尾）
+    auto t0 = std::chrono::steady_clock::now();
+    file.flush();
+    statFlushUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+    statFlushCnt.fetch_add(1, std::memory_order_relaxed);
+}
+
+DiskIoStat Disk::getIoStat() const
+{
+    // 观测快照：relaxed 读即可（累加值，不强一致）
+    DiskIoStat s;
+    s.writeCnt = statWriteCnt.load(std::memory_order_relaxed);
+    s.writeBytes = statWriteBytes.load(std::memory_order_relaxed);
+    s.buildUs = statBuildUs.load(std::memory_order_relaxed);
+    s.fileUs = statFileUs.load(std::memory_order_relaxed);
+    s.flushUs = statFlushUs.load(std::memory_order_relaxed);
+    s.flushCnt = statFlushCnt.load(std::memory_order_relaxed);
+    s.readCnt = statReadCnt.load(std::memory_order_relaxed);
+    s.readUs = statReadUs.load(std::memory_order_relaxed);
+    return s;
 }
 
 
@@ -207,7 +240,7 @@ int Disk::persisData(const std::string& varName)
     // 单条持久化 = 显式落盘点：组装（定长头+实体直写缓冲）→ 整条一次写 → flush
     int code = appendRecord(varName, val);
     if (code == SUCCESS) {
-        file.flush();
+        flushSync();
         if (!file) code = UNKNOWN_ERROR;	// flush 失败视同写失败
     }
     if (code != SUCCESS) {
@@ -246,7 +279,7 @@ int Disk::persisData(const std::string& varName, const Val& val)
     // 数据已从缓存删除，无 isDirty 可清/可恢复：组装 → 整条一次写 → flush（失败无法重试，调用方自行处理）
     int code = appendRecord(varName, val);
     if (code == SUCCESS) {
-        file.flush();
+        flushSync();
         if (!file) code = UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试）
     }
     return code;
@@ -267,7 +300,7 @@ int Disk::persisData(std::vector<std::pair<std::string, Val>> dataSet)
     }
 
     if (file.is_open()) {
-        file.flush();	// 整批一次 flush
+        flushSync();	// 整批一次 flush
         if (!file) {
             return UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试，调用方自行处理）
         }
@@ -337,7 +370,7 @@ int Disk::persisData(std::vector<std::string> varNameSet)
     }
 
     if (file.is_open()) {
-        file.flush();	// 整批一次 flush
+        flushSync();	// 整批一次 flush
         if (!file) {
             // 批量写失败：已清的 isDirty 全部置回 true，等待下次重刷
             {
@@ -386,6 +419,9 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     if (it == inDisk.end()) return FIND_FAILED;	// 磁盘没有该数据
     int offset = it->second;
 
+    // 读耗时观测起点（含文件开关 + 读记录 + 反序列化，成功读回才记账）
+    auto t0 = std::chrono::steady_clock::now();
+
     /* ========== 打开文件读取 =========== */
     std::ifstream file(dbName, std::ios::binary);
     if (!file) return FILE_OPEN_FILED;	// 文件打开失败
@@ -433,6 +469,9 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     val.expireTime = val.isPermanent
         ? std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS))
         : std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
+    statReadUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);	// 磁盘读耗时记账
+    statReadCnt.fetch_add(1, std::memory_order_relaxed);
     return SUCCESS;
 }
 
@@ -703,7 +742,7 @@ int Disk::reWrite()
         if (code != SUCCESS && code != FIND_FAILED) return code;
     }
 
-    file.flush();
+    flushSync();
     if (!file) return UNKNOWN_ERROR;
 
     // 全部完成后截断到写游标位置（清掉空洞/已删数据），重写后 curSize 重新统计

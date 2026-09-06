@@ -288,6 +288,23 @@ static void printLoad(const char* title, const LoadResult& r, const CacheStat& s
 		<< evictAvgMs << " ms per call / evict-ratio " << evictRatio << "%" << std::endl;
 }
 
+// ============ 磁盘 IO 阶段占比输出 ============
+
+// 序列化 / 文件写 / flush / 磁盘读 / 队列积压与 worker 忙碌（占比按 RUN_SECONDS 计算）
+static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double seconds) {
+	double runMs = seconds * 1000.0;
+	std::cout << "  disk-write: " << io.writeCnt << " recs / " << (io.writeBytes / 1024 / 1024) << " MB" << std::endl;
+	std::cout << "    build(serialize) " << (io.buildUs / 1000) << " ms | file-write " << (io.fileUs / 1000)
+		<< " ms | flush " << (io.flushUs / 1000) << " ms (" << io.flushCnt << " calls)" << std::endl;
+	std::cout << "    per-write avg: build " << (io.writeCnt ? io.buildUs / io.writeCnt : 0)
+		<< " us | file " << (io.writeCnt ? io.fileUs / io.writeCnt : 0) << " us" << std::endl;
+	std::cout << "  disk-read: " << io.readCnt << " reads / " << (io.readUs / 1000) << " ms"
+		<< " (avg " << (io.readCnt ? io.readUs / io.readCnt : 0) << " us)" << std::endl;
+	double busyRatio = q.busyUs > 0 ? 100.0 * (q.busyUs / 1000.0) / runMs : 0.0;
+	std::cout << "  disk-queue: depth avg " << q.avgDepth << " / max " << q.maxDepth
+		<< " | worker busy " << (q.busyUs / 1000) << " ms = " << busyRatio << "% (" << q.runCnt << " tasks)" << std::endl;
+}
+
 // ============ 场景 ============
 
 // QPS 档场景：预热池 95M（含注入池则边测边 add 新 key 制造淘汰压力）
@@ -315,6 +332,7 @@ static void qpsScene(const char* title, double readRate) {
 	LoadResult r = runLoad(db, pool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
 	CacheStat s = db.getStat();
 	printLoad(title, r, s, RUN_SECONDS);
+	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
 }
 
 // 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机（1K~10M），纯读按冷热分布 30s
@@ -340,6 +358,7 @@ static void hitRateScene(int times) {
 	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, log-normal 1K-10M)",
 		times, static_cast<long long>(poolBytes / 1024 / 1024));
 	printLoad(title, r, s, RUN_SECONDS);
+	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
 }
 
 // ============ main ============
@@ -352,7 +371,7 @@ int main() {
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
 	// qpsScene("[1] QPS - read-only", 1.0);
-	qpsScene("[2] QPS - read80/write20", 0.7);
+	qpsScene("[2] QPS - read70/write30", 0.7);
 	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存

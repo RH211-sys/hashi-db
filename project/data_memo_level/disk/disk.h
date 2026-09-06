@@ -3,6 +3,7 @@
 #define _DISK_H_
 
 #include "../data_type.h"
+#include <atomic>
 #include <fstream>
 #include <utility>
 #include <vector>
@@ -10,6 +11,21 @@
 #include <unordered_map>
 
 class Cache;
+
+/*
+	磁盘 IO 阶段统计（供性能归因，非功能）：序列化 / 文件写 / flush / 磁盘读的耗时与量
+	计数为 relaxed 原子累加（磁盘线程与测试线程读，不做强一致）
+*/
+struct DiskIoStat {
+	long long writeCnt = 0;		// 追加写记录数（appendRecord 成功）
+	long long writeBytes = 0;	// 追加写总字节数
+	long long buildUs = 0;		// 记录组装（实体序列化直写缓冲）总耗时（µs）
+	long long fileUs = 0;		// 记录文件写（seekp + 整条 write + 校验码回写）总耗时（µs）
+	long long flushUs = 0;		// flush 总耗时（µs）
+	long long flushCnt = 0;		// flush 调用次数
+	long long readCnt = 0;		// 磁盘读成功次数（selData 单条：读回 + 反序列化）
+	long long readUs = 0;		// 磁盘读总耗时（µs，含文件开关与反序列化）
+};
 
 class Disk {
 	friend class Cache;
@@ -24,6 +40,16 @@ private:
 	std::fstream file;			// 常驻文件句柄（读+写：所有持久化/重写复用，免每次 open/close）
 	std::vector<char> recBuf;	// 单条记录组装缓冲（定长头 + 实体字节，序列化直写、整条一次落盘）
 
+	// 观测统计（relaxed 累加，磁盘线程单侧写，测试侧读）
+	std::atomic<long long> statWriteCnt{ 0 };
+	std::atomic<long long> statWriteBytes{ 0 };
+	std::atomic<long long> statBuildUs{ 0 };	// 组装（序列化）耗时
+	std::atomic<long long> statFileUs{ 0 };		// 记录文件写耗时
+	std::atomic<long long> statFlushUs{ 0 };	// flush 耗时
+	std::atomic<long long> statFlushCnt{ 0 };
+	std::atomic<long long> statReadCnt{ 0 };
+	std::atomic<long long> statReadUs{ 0 };
+
 	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
 	bool ensureFileOpen();
 	// 组装单条记录到 recBuf：定长头（校验码由 code 参数给定）+ 实体字节（直接序列化进缓冲）
@@ -32,6 +58,8 @@ private:
 	// 追加写单条记录（两段式校验码：先整条 CHECK_BROKEN，写毕回写 CHECK_VALID）
 	// 不 flush（调用方按批 flush）；成功更新 inDisk/curSize
 	int appendRecord(const std::string& varName, const Val& val);
+	// flush 并记账（调用方各写路径共用）
+	void flushSync();
 
 public:
 	explicit Disk(const long long& maxSize, std::string& dbName);
@@ -40,6 +68,9 @@ public:
 	/* ========== special operation 特殊操作 ========== */
 
 	inline bool containsVar(const std::string& varName) { return inDisk.contains(varName); }
+
+	// 观测快照：磁盘 IO 阶段统计（序列化/文件写/flush/读）
+	DiskIoStat getIoStat() const;
 
 	/* ========== operation function(操作函数) ========== */
 
