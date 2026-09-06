@@ -37,6 +37,9 @@ struct DiskIoStat {
 	long long selOk = 0;		// 读盘成功（与 readCnt 同义，单独计数便于核对）
 	long long compactCnt = 0;	// 自动压缩（容量超限触发的 reWrite）次数
 	long long compactFail = 0;	// 自动压缩失败次数（失败会留下陈旧偏移 → 读失败来源）
+	long long compactUs = 0;	// 压缩总耗时（µs；只统计成功完成的压缩）
+	long long compactBefore = 0;// 压缩前文件逻辑大小累计（字节；用于算空洞回收量）
+	long long compactAfter = 0;	// 压缩后文件大小累计（字节 = 各次 writePos 之和）
 };
 
 class Disk {
@@ -74,6 +77,9 @@ private:
 	std::atomic<long long> statSelOk{ 0 };
 	std::atomic<long long> statCompactCnt{ 0 };
 	std::atomic<long long> statCompactFail{ 0 };
+	std::atomic<long long> statCompactUs{ 0 };
+	std::atomic<long long> statCompactBefore{ 0 };
+	std::atomic<long long> statCompactAfter{ 0 };
 
 	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
 	bool ensureFileOpen();

@@ -226,6 +226,9 @@ DiskIoStat Disk::getIoStat() const
     s.selOk = statSelOk.load(std::memory_order_relaxed);
     s.compactCnt = statCompactCnt.load(std::memory_order_relaxed);
     s.compactFail = statCompactFail.load(std::memory_order_relaxed);
+    s.compactUs = statCompactUs.load(std::memory_order_relaxed);
+    s.compactBefore = statCompactBefore.load(std::memory_order_relaxed);
+    s.compactAfter = statCompactAfter.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -711,6 +714,10 @@ int Disk::reWrite()
     //          写游标不再需要保护未读数据，可安全覆盖/追加。
     // 为何两阶段：若把"会变大的缓存写"与"读旧搬移"按偏移交错进行，变大的写会造成写游标前跳，
     // 盖掉后面还没读的旧记录（写覆盖读）→ read-head 失败/索引陈旧（见此前 debug 记录）。
+    // —— 压缩观测起点：耗时 + 压缩前文件大小（评估空洞回收，方向1）——
+    auto compactT0 = std::chrono::steady_clock::now();
+    const long long compactBeforeBytes = curSize;
+
     auto c = cache.lock();
     if (!c) return UNKNOWN_ERROR;	// 缓存未绑定或已析构
 
@@ -875,5 +882,10 @@ int Disk::reWrite()
     if (ec) { reportRewriteFail(dbName, "resize", "", -1); return UNKNOWN_ERROR; }	// 截断失败
 
     curSize = writePos;
+    // —— 压缩观测记账（仅成功路径；失败由调用方 compactFail 计数）——
+    statCompactUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - compactT0).count()), std::memory_order_relaxed);
+    statCompactBefore.fetch_add(compactBeforeBytes, std::memory_order_relaxed);
+    statCompactAfter.fetch_add(writePos, std::memory_order_relaxed);
     return SUCCESS;
 }

@@ -44,16 +44,28 @@
 */
 
 // ============ 配置 ============
-
-constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（超限触发全局采样淘汰）
-constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M
+// 测试比例基准（缓存 : 数据集 : 磁盘 ≈ 1 : 3 : 5），依据业界做法：
+//   - Redis Enterprise Auto Tiering（内存热层 + 闪存冷层，与本项目模型一致）：
+//     RAM 保留全部 key/索引 + 热数据(工作集)，建议 RAM 至少占总 value 的 20%，
+//     闪存容量 ≥ 总数据，并另留写放大/缓冲余量；适用"工作集<<数据集 + 热点明显"，
+//     不适用"访问均匀 / 工作集≈数据集"（那会把淘汰抖动当正常业务来测）。
+//   - 80/20 热冷：缓存按"热集"而非全量定容（cache ≈ 热集字节 + 余量）。
+//   - 对比参考：Pika/SSD 型是"数据全落盘+内存小缓冲"，不是本项目的热冷分层模型。
+//   详见 doc/arch/data_memo_doc/实现阶段/二轮优化/（优化1.md / 测试比例讨论）
+constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（1）
+constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M（5，≥ 数据集 + 压缩/写放大余量）
 constexpr int POOL_THREADS = 8;							// 读/写线程池线程数
 constexpr int WRITE_INFLIGHT = 4;						// 每线程在途写请求数（窗口深度；=1 退化为 test2 同步写）
 const std::string DB_NAME = "test3_data.dat";			// 数据文件
-constexpr long long WARM_BYTES = 95LL * 1024 * 1024;	// QPS 档预热池 70M（接近缓存上限但预热不触发淘汰；写波动即超限）
+// 数据集档位（3）：
+//   QPS 正常档 300M（≈1:3:5）；命中率对照档 2x/3x(=200M/300M，对应 1:2:5 / 1:3:5)。
+//   唯一数据总量始终 ≤ 磁盘 500M，磁盘上限不被"不断新增的唯一数据"顶穿；
+//   热更新产生的版本 churn 由磁盘自动压缩回收，不计入唯一数据。
+constexpr long long WARM_BYTES = 300LL * 1024 * 1024;	// QPS 档数据集（预热池）300M
+constexpr int INJECT_KEYS = 60;							// 缓慢新增新 key：60 条（≈24MB，数据集 300→~324M，≈1:3.2:5）
 constexpr double RUN_SECONDS = 30.0;					// 每场景固定时长
 constexpr int WORKERS = 8;								// 压测线程数
-constexpr int INJECT_MS = 30;							// 注入线程 add 间隔（约 33 条/s，30s 内磁盘余量内）
+constexpr int INJECT_MS = 500;							// 注入间隔（≈2 key/s）：模拟数据集缓慢增长，不做注入洪流
 constexpr size_t SAMPLE_CAP = 200000;					// 延迟样本蓄水池上限 / 线程
 
 // ============ 测试数据实体（1K~10M 随机内容） ============
@@ -95,6 +107,14 @@ static long long randSizeLogNormal(std::mt19937& rng) {
 	if (lg < 3.0) lg = 3.0;	// 钳位 1K
 	if (lg > 7.0) lg = 7.0;	// 钳位 10M
 	return static_cast<long long>(std::pow(10.0, lg));
+}
+
+// 写尺寸档（"更新同量级数据"）：4K ~ 1M 对数均匀（均值 ~190KB）
+// 相比 randSizeTiered 的 1M~10M 顶档，避免"每次随机写都可能蹦出 10M 版本"造成的版本放大；
+// 保留 1M 上限用于触发容量/淘汰，但把放大压低到贴近真实业务更新。
+static long long randSizeUpdate(std::mt19937& rng) {
+	static thread_local std::uniform_real_distribution<double> dist(12.0, 20.0);	// 2^12=4K .. 2^20=1M
+	return static_cast<long long>(std::pow(2.0, dist(rng)));
 }
 
 // 构造随机内容的实体（内容不跨进程使用，字节序无约束）
@@ -219,7 +239,7 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 					size_t idx = pickIdx(rng);
 					auto t0 = std::chrono::steady_clock::now();
 					win[i].submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
-					win[i].fut = db.modData(pool[idx].key, std::move(makeData(randSizeTiered(rng), rng)));
+					win[i].fut = db.modData(pool[idx].key, std::move(makeData(randSizeUpdate(rng), rng)));
 				}
 			}
 			int winHead = 0;	// 当前要取回的最旧写槽
@@ -246,7 +266,7 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 
 					auto t0 = std::chrono::steady_clock::now();
 					s.submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
-					s.fut = db.modData(pool[idx].key, std::move(makeData(randSizeTiered(rng), rng)));
+					s.fut = db.modData(pool[idx].key, std::move(makeData(randSizeUpdate(rng), rng)));
 					winHead = (winHead + 1) % WRITE_INFLIGHT;
 				}
 				++localDone;
@@ -336,12 +356,16 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 	double busyRatio = q.busyUs > 0 ? 100.0 * (q.busyUs / 1000.0) / runMs : 0.0;
 	std::cout << "  disk-queue: depth avg " << q.avgDepth << " / max " << q.maxDepth
 		<< " | worker busy " << (q.busyUs / 1000) << " ms = " << busyRatio << "% (" << q.runCnt << " tasks)" << std::endl;
-	std::cout << "  disk-compact: " << io.compactCnt << " runs / fail " << io.compactFail << std::endl;
+	double avgCompactMs = io.compactCnt > 0 ? static_cast<double>(io.compactUs) / io.compactCnt / 1000.0 : 0.0;
+	std::cout << "  disk-compact: " << io.compactCnt << " runs / fail " << io.compactFail
+		<< " | time " << (io.compactUs / 1000) << " ms (avg " << avgCompactMs << " ms/call)"
+		<< " | file " << (io.compactBefore / 1024 / 1024) << "MB -> " << (io.compactAfter / 1024 / 1024)
+		<< "MB (reclaim " << ((io.compactBefore - io.compactAfter) / 1024 / 1024) << "MB)" << std::endl;
 }
 
 // ============ 场景 ============
 
-// QPS 档场景：预热池 95M（含注入池则边测边 add 新 key 制造淘汰压力）
+// QPS 档场景：数据集 300M（1:3:5；含注入池则缓慢 add 新 key 模拟数据集增长）
 static void qpsScene(const char* title, double readRate) {
 	std::filesystem::remove(DB_NAME);
 	Controller db(MEMO_SIZE, DISK_SIZE, POOL_THREADS, DB_NAME);
@@ -354,12 +378,12 @@ static void qpsScene(const char* title, double readRate) {
 	warmUp(db, pool, rng);
 	std::cout << "[prewarm done] load running for 30s (WRITE_INFLIGHT=" << WRITE_INFLIGHT << ")" << std::endl;
 
-	// 注入池（写场景）：约 800 条新 key ≈ 24s 注入量
+	// 注入池（写场景）：INJECT_KEYS 条缓慢新增（≈24MB），与预热 300M 合计 ≈ 324M（≈1:3.2:5），见顶部比例说明
 	std::vector<PoolEntry> injectPool;
 	if (readRate < 1.0) {
 		std::mt19937 rng2(0x20250903);
-		for (int i = 0; i < 800; ++i) {
-			injectPool.push_back({ "inj_" + std::to_string(i), randSizeTiered(rng2) });
+		for (int i = 0; i < INJECT_KEYS; ++i) {
+			injectPool.push_back({ "inj_" + std::to_string(i), randSizeUpdate(rng2) });
 		}
 	}
 
@@ -404,10 +428,10 @@ int main() {
 	// qpsScene("[1] QPS - read-only", 1.0);
 	// qpsScene("[3] QPS - write-only", 0.0);
 
-	// 2. 缓存命中率：总数据 2x / 3x / 4x 缓存
-	//hitRateScene(2);
-	//hitRateScene(3);
-	//hitRateScene(4);
+	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
+	hitRateScene(2);
+	// hitRateScene(3);
+	//hitRateScene(4);	// 4x=400M（≈1:4:5）可选对照；跑全量会明显增加预热时长与 SSD 写入
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
 	double totalSec = std::chrono::duration<double>(
