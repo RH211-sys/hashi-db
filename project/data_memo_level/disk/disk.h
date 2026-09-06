@@ -3,6 +3,7 @@
 #define _DISK_H_
 
 #include "../data_type.h"
+#include <fstream>
 #include <utility>
 #include <vector>
 #include <list>
@@ -19,8 +20,22 @@ private:
 	std::string dbName;		// 数据库名称(文件名)
 	std::unordered_map<std::string, int> inDisk;		// 变量名 + 偏移量
 
+	// ===== 磁盘 IO（仅磁盘线程访问，天然串行，无需锁）=====
+	std::fstream file;			// 常驻文件句柄（读+写：所有持久化/重写复用，免每次 open/close）
+	std::vector<char> recBuf;	// 单条记录组装缓冲（定长头 + 实体字节，序列化直写、整条一次落盘）
+
+	// 惰性打开/IO 错误后重建句柄：确保 file 已打开且可用（仅在写路径调用）
+	bool ensureFileOpen();
+	// 组装单条记录到 recBuf：定长头（校验码由 code 参数给定）+ 实体字节（直接序列化进缓冲）
+	// 成功返回 SUCCESS 并写出 dataSize（实体字节数）/ recLen（整条长度，= recBuf.size()）
+	int buildRecord(const std::string& varName, const Val& val, char code, int& dataSize);
+	// 追加写单条记录（两段式校验码：先整条 CHECK_BROKEN，写毕回写 CHECK_VALID）
+	// 不 flush（调用方按批 flush）；成功更新 inDisk/curSize
+	int appendRecord(const std::string& varName, const Val& val);
+
 public:
 	explicit Disk(const long long& maxSize, std::string& dbName);
+	~Disk();
 
 	/* ========== special operation 特殊操作 ========== */
 

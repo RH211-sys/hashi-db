@@ -4,11 +4,47 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <ostream>
+#include <streambuf>
 
 /*
     <fstream> 用于读写文件内容
     <filesystem> 用于操作文件和目录本身。
 */
+
+namespace {
+    // 追加写 vector<char> 的流缓冲：cereal 序列化直接进连续记录缓冲，免 stringstream/二次整块拷贝
+    class VecBuf : public std::streambuf {
+        std::vector<char>& out;
+    public:
+        explicit VecBuf(std::vector<char>& o) : out(o) {}
+    protected:
+        int_type overflow(int_type ch) override {
+            out.emplace_back(static_cast<char>(traits_type::to_char_type(ch)));
+            return ch;
+        }
+        std::streamsize xsputn(const char* s, std::streamsize n) override {
+            out.insert(out.end(), s, s + n);
+            return n;
+        }
+    };
+    // 配 VecBuf 的输出流（成员初始化顺序：先 m_buf 后基类无法保证，故基类先置空再 rdbuf 接管）
+    class VecStream : public std::ostream {
+        VecBuf m_buf;
+    public:
+        explicit VecStream(std::vector<char>& o) : std::ostream(nullptr), m_buf(o) { rdbuf(&m_buf); }
+    };
+
+    // 记录头偏移（与 protocol.h 布局一致，HEAD_SIZE = 86）
+    // code | dataSize(4) | updateUS(8) | expireUS(8) | isPermanent(1) | typeBuf(32) | nameBuf(32) | 实体字节
+    constexpr std::size_t HEAD_DS = CODE_LEN;
+    constexpr std::size_t HEAD_UPDATE = HEAD_DS + ENTITY_SIZE_LEN;
+    constexpr std::size_t HEAD_EXPIRE = HEAD_UPDATE + UPDATE_TIME_LEN;
+    constexpr std::size_t HEAD_PERM = HEAD_EXPIRE + EXPIRE_TIME_LEN;
+    constexpr std::size_t HEAD_TYPE = HEAD_PERM + IS_PERMANENT_LEN;
+    constexpr std::size_t HEAD_NAME = HEAD_TYPE + TYPE_LEN;
+    constexpr std::size_t HEAD_SIZE = HEAD_NAME + NAME_LEN;
+}
 
 
 Disk::Disk(const long long& maxSize, std::string& dbName)
@@ -19,9 +55,85 @@ Disk::Disk(const long long& maxSize, std::string& dbName)
 
 }
 
+Disk::~Disk() = default;
+
 void Disk::setCache(std::shared_ptr<Cache> c)
 {
     cache = c;
+}
+
+bool Disk::ensureFileOpen()
+{
+    if (file.is_open() && file.good()) return true;
+    if (file.is_open()) file.close();	// 打开但状态异常（上次 IO 失败）：关闭重建
+    // 文件不存在时 in|out 打不开：先以 app 模式创建（保持既有"首次写建文件"语义）
+    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
+    touch.close();
+    file.open(dbName, std::ios::in | std::ios::out | std::ios::binary);
+    return file.is_open() && file.good();
+}
+
+int Disk::buildRecord(const std::string& varName, const Val& val, char code, int& dataSize)
+{
+    /* ========== 基本信息校验 =========== */
+    // 变量名超长：定长字段放不下，无法写入
+    if (varName.size() > NAME_LEN) return LONG_NAME;
+    // 查类型注册表（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
+    auto reg = typeReg.find(val.typeName);
+    if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
+    // 类型名超长：定长字段放不下，截断后无法反序列化
+    if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
+
+    /* ========== 组装整条记录 =========== */
+    // 定长头占位（全零 = 0x00，恰为 CHECK_BROKEN），实体字节随后直接序列化进同一缓冲
+    recBuf.clear();
+    recBuf.resize(HEAD_SIZE);
+    {
+        VecStream os(recBuf);
+        reg->second.first(*val.entity, os);	// 实体字节追加到 recBuf[HEAD_SIZE..]，零中间拷贝
+    }
+    dataSize = static_cast<int>(recBuf.size() - HEAD_SIZE);	// 数据大小：只含实体
+
+    // 时间信息（updateTime 已是 µs 整数；expireTime 仍为 time_point）
+    long long updateUS = val.updateTime.load(std::memory_order_relaxed);
+    long long expireUS = val.isPermanent ? 0
+        : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
+
+    char* p = recBuf.data();
+    p[0] = code;
+    memcpy(p + HEAD_DS, &dataSize, ENTITY_SIZE_LEN);
+    memcpy(p + HEAD_UPDATE, &updateUS, UPDATE_TIME_LEN);
+    memcpy(p + HEAD_EXPIRE, &expireUS, EXPIRE_TIME_LEN);
+    memcpy(p + HEAD_PERM, &val.isPermanent, IS_PERMANENT_LEN);
+    memcpy(p + HEAD_TYPE, val.typeName.c_str(), val.typeName.size());	// 其余由 resize 清零补足定长
+    memcpy(p + HEAD_NAME, varName.c_str(), varName.size());
+    return SUCCESS;
+}
+
+int Disk::appendRecord(const std::string& varName, const Val& val)
+{
+    if (!ensureFileOpen()) return FILE_OPEN_FILED;	// 常驻句柄不可用
+
+    int dataSize = 0;
+    int code = buildRecord(varName, val, CHECK_BROKEN, dataSize);
+    if (code != SUCCESS) return code;
+
+    // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
+    file.seekp(0, std::ios::end);
+    std::streamoff offset = file.tellp();	// 记录偏移 = 文件当前大小
+    if (!file) { file.clear(); return UNKNOWN_ERROR; }
+
+    // 两段式写：整条一次写入（头含无效校验码），写毕回写有效码（写一半崩溃 → 校验码无效，重建时截断）
+    file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
+    file.seekp(offset);						// 回写有效校验码
+    char valid = CHECK_VALID;
+    file.write(&valid, CODE_LEN);
+    if (!file) return UNKNOWN_ERROR;
+
+    // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
+    inDisk[varName] = static_cast<int>(offset);
+    curSize += static_cast<long long>(recBuf.size());	// 只增不减：空洞/已删数据不回收，重写时重新统计
+    return SUCCESS;
 }
 
 
@@ -79,36 +191,10 @@ int Disk::persisData(const std::string& varName)
     // 类型名超长：定长字段放不下，截断后无法反序列化
     if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
-    /* ========== 序列化 =========== */
-
-    std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
-    int dataSize = (int)bytes.size();			// 数据大小：只含实体
-    int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
-
-    // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
-    long long updateUS = val.updateTime.load(std::memory_order_relaxed);
-    long long expireUS = 
-        val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
-
-    // 类型名补 '\0' 到定长
-    char typeBuf[TYPE_LEN] = { 0 };
-    memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
-
-    // 变量名补 '\0' 到定长
-    char nameBuf[NAME_LEN] = { 0 };
-    memcpy(nameBuf, varName.c_str(), varName.size());
-
-    /* ========== 打开文件并进行写入 =========== */
-
-    // 确保文件存在（in|out 模式打不开不存在的文件，首次写先创建）
-    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
-    touch.close();
-
-    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
+    /* ========== 组装 + 追加写 =========== */
 
     // 写文件前先清 isDirty（写锁内）：防止写文件期间缓存被改（新脏数据）后误清
-    // 若写文件失败则置回 true，等待下次重刷
+    // 若写盘失败则置回 true，等待下次重刷
     {
         c->rwMutex->lock();
         auto it = c->cache_db.find(varName);
@@ -118,26 +204,13 @@ int Disk::persisData(const std::string& varName)
         c->rwMutex->unlock();
     }
 
-    // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
-    file.seekp(0, std::ios::end);
-    int offset = (int)file.tellp();	// 记录偏移 = 文件当前大小
-
-    // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
-    file.seekp(offset);
-    char broken = CHECK_BROKEN;
-    file.write(&broken, CODE_LEN);
-    file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-    file.write((char*)&updateUS, UPDATE_TIME_LEN);
-    file.write((char*)&expireUS, EXPIRE_TIME_LEN);
-    file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
-    file.write(typeBuf, TYPE_LEN);
-    file.write(nameBuf, NAME_LEN);
-    file.write(bytes.data(), dataSize);
-    file.seekp(offset);		// 回写有效校验码
-    char valid = CHECK_VALID;
-    file.write(&valid, CODE_LEN);
-    file.flush();
-    if (!file) {
+    // 单条持久化 = 显式落盘点：组装（定长头+实体直写缓冲）→ 整条一次写 → flush
+    int code = appendRecord(varName, val);
+    if (code == SUCCESS) {
+        file.flush();
+        if (!file) code = UNKNOWN_ERROR;	// flush 失败视同写失败
+    }
+    if (code != SUCCESS) {
         // 写失败：isDirty 置回 true，等待下次重刷
         {
             c->rwMutex->lock();
@@ -147,14 +220,8 @@ int Disk::persisData(const std::string& varName)
             }
             c->rwMutex->unlock();
         }
-        return UNKNOWN_ERROR;	// 写入失败
+        return code;
     }
-
-    /* ========== 更新disk的大小记录 =========== */
-
-    // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
-    inDisk[varName] = offset;
-    curSize += recLen;	// 只增不减：空洞/已删数据不回收，重写时重新统计
     return SUCCESS;
 }
 
@@ -167,153 +234,43 @@ int Disk::persisData(const std::string& varName, const Val& val)
     // 变量名超长：定长字段放不下，无法写入
     if (varName.size() > NAME_LEN) return LONG_NAME;
 
-    // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
+    // 查类型注册表（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
     auto reg = typeReg.find(val.typeName);
     if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
 
     // 类型名超长：定长字段放不下，截断后无法反序列化
     if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
-    /* ========== 序列化 =========== */
+    /* ========== 组装 + 追加写 =========== */
 
-    std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
-    int dataSize = (int)bytes.size();			// 数据大小：只含实体
-    int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
-
-    // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
-    long long updateUS = val.updateTime.load(std::memory_order_relaxed);
-    long long expireUS =
-        val.isPermanent ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
-
-    // 类型名补 '\0' 到定长
-    char typeBuf[TYPE_LEN] = { 0 };
-    memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
-
-    // 变量名补 '\0' 到定长
-    char nameBuf[NAME_LEN] = { 0 };
-    memcpy(nameBuf, varName.c_str(), varName.size());
-
-    /* ========== 打开文件并进行写入 =========== */
-
-    // 确保文件存在（in|out 模式打不开不存在的文件，首次写先创建）
-    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
-    touch.close();
-
-    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
-
-    // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
-    file.seekp(0, std::ios::end);
-    int offset = (int)file.tellp();	// 记录偏移 = 文件当前大小
-
-    // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
-    file.seekp(offset);
-    char broken = CHECK_BROKEN;
-    file.write(&broken, CODE_LEN);
-    file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-    file.write((char*)&updateUS, UPDATE_TIME_LEN);
-    file.write((char*)&expireUS, EXPIRE_TIME_LEN);
-    file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
-    file.write(typeBuf, TYPE_LEN);
-    file.write(nameBuf, NAME_LEN);
-    file.write(bytes.data(), dataSize);
-    file.seekp(offset);		// 回写有效校验码
-    char valid = CHECK_VALID;
-    file.write(&valid, CODE_LEN);
-    file.flush();
-    if (!file) {
-        return UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试，调用方自行处理）
+    // 数据已从缓存删除，无 isDirty 可清/可恢复：组装 → 整条一次写 → flush（失败无法重试，调用方自行处理）
+    int code = appendRecord(varName, val);
+    if (code == SUCCESS) {
+        file.flush();
+        if (!file) code = UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试）
     }
-
-    /* ========== 更新disk的大小记录 =========== */
-
-    // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
-    inDisk[varName] = offset;
-    curSize += recLen;	// 只增不减：空洞/已删数据不回收，重写时重新统计
-    return SUCCESS;
+    return code;
 }
 
 int Disk::persisData(std::vector<std::pair<std::string, Val>> dataSet)
 {
     if (dataSet.empty()) return SUCCESS;
 
-    // 确保文件存在（in|out 模式打不开不存在的文件，首次写先创建）
-    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
-    touch.close();
-
-    // 一次文件开关写入多条数据：批量落盘，减少物理磁盘 IO 频率
-    // （写入先进页缓存，多个数据可能合并为一次物理落盘）
-    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
-
-    // 单条写入（流程同带数据单变量版）：数据由调用方提供，不查缓存、不动 isDirty（淘汰时缓存已删）
-    auto writeOne = [&](const std::string& varName, const Val& val) -> int {
-        /* ========== 检查基本信息是否正确 =========== */
-        // 变量名超长：定长字段放不下，无法写入
-        if (varName.size() > NAME_LEN) return LONG_NAME;
-        // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
-        auto reg = typeReg.find(val.typeName);
-        if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
-        // 类型名超长：定长字段放不下，截断后无法反序列化
-        if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
-
-        /* ========== 序列化 ========== */
-        std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
-        int dataSize = (int)bytes.size();			// 数据大小：只含实体
-        int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
-
-        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
-        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
-        long long expireUS = val.isPermanent ? 0
-            : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
-
-        // 类型名补 '\0' 到定长
-        char typeBuf[TYPE_LEN] = { 0 };
-        memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
-
-        // 变量名补 '\0' 到定长
-        char nameBuf[NAME_LEN] = { 0 };
-        memcpy(nameBuf, varName.c_str(), varName.size());
-
-        /* ========== 追加写入 =========== */
-        // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
-        file.seekp(0, std::ios::end);
-        int offset = (int)file.tellp();	// 记录偏移 = 文件当前大小
-
-        // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
-        file.seekp(offset);
-        char broken = CHECK_BROKEN;
-        file.write(&broken, CODE_LEN);
-        file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-        file.write((char*)&updateUS, UPDATE_TIME_LEN);
-        file.write((char*)&expireUS, EXPIRE_TIME_LEN);
-        file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
-        file.write(typeBuf, TYPE_LEN);
-        file.write(nameBuf, NAME_LEN);
-        file.write(bytes.data(), dataSize);
-        file.seekp(offset);		// 回写有效校验码
-        char valid = CHECK_VALID;
-        file.write(&valid, CODE_LEN);
-
-        /* ========== 更新disk的大小记录 =========== */
-        // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
-        inDisk[varName] = offset;
-        curSize += recLen;	// 只增不减：空洞/已删数据不回收，重写时重新统计
-        return SUCCESS;
-    };
-
-    /* ========== 循环写入 =========== */
+    // 一次常驻句柄写多条数据：批量落盘，减少物理磁盘 IO 频率
+    // （写入先进页缓存，多个数据可能合并为一次物理落盘；组装+整条一次写见 appendRecord）
     int firstError = SUCCESS;	// 记录首个错误码，其余变量继续处理
     for (const auto& item : dataSet) {
-        int code = writeOne(item.first, item.second);
+        int code = appendRecord(item.first, item.second);
         if (code != SUCCESS && firstError == SUCCESS) {
             firstError = code;
         }
     }
 
-    file.flush();
-    if (!file) {
-        return UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试，调用方自行处理）
+    if (file.is_open()) {
+        file.flush();	// 整批一次 flush
+        if (!file) {
+            return UNKNOWN_ERROR;	// 写入失败（数据已从缓存删，无法重试，调用方自行处理）
+        }
     }
     return firstError;
 }
@@ -325,15 +282,6 @@ int Disk::persisData(std::vector<std::string> varNameSet)
     // 从缓存拿缓存指针（非锁，不阻塞）
     auto c = cache.lock();
     if (!c) return UNKNOWN_ERROR;	// 缓存未绑定或已析构
-
-    // 确保文件存在（in|out 模式打不开不存在的文件，首次写先创建）
-    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
-    touch.close();
-
-    // 一次文件开关写入多条数据：批量落盘，减少物理磁盘 IO 频率
-    // （写入先进页缓存，多个数据可能合并为一次物理落盘）
-    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
 
     // 已清 isDirty 的变量名：批量写失败时统一置回 true
     std::vector<std::string> clearedNames;
@@ -356,32 +304,14 @@ int Disk::persisData(std::vector<std::string> varNameSet)
         /* ========== 检查基本信息是否正确 =========== */
         // 变量名超长：定长字段放不下，无法写入
         if (varName.size() > NAME_LEN) return LONG_NAME;
-        // 查类型注册表，序列化实体（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
+        // 查类型注册表（any 类型擦除，运行时只能按 typeName 查表拿模板实例）
         auto reg = typeReg.find(val.typeName);
         if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
         // 类型名超长：定长字段放不下，截断后无法反序列化
         if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
-        /* ========== 序列化 =========== */
-        std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
-        int dataSize = (int)bytes.size();			// 数据大小：只含实体
-        int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;	// 记录总长：校验码 + 实体大小 + 时间信息 + 类型名定长 + 变量名定长 + 实体
-
-        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
-        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
-        long long expireUS = val.isPermanent ? 0
-            : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
-
-        // 类型名补 '\0' 到定长
-        char typeBuf[TYPE_LEN] = { 0 };
-        memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
-
-        // 变量名补 '\0' 到定长
-        char nameBuf[NAME_LEN] = { 0 };
-        memcpy(nameBuf, varName.c_str(), varName.size());
-
         /* ========== 追加写入 =========== */
-        // 写文件前先清 isDirty（写锁内）：防止写文件期间缓存被改（新脏数据）后误清
+        // 写盘前先清 isDirty（写锁内）：防止写文件期间缓存被改（新脏数据）后误清
         // 若批量写失败则统一置回 true，等待下次重刷
         {
             c->rwMutex->lock();
@@ -393,30 +323,8 @@ int Disk::persisData(std::vector<std::string> varNameSet)
             clearedNames.emplace_back(varName);
         }
 
-        // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
-        file.seekp(0, std::ios::end);
-        int offset = (int)file.tellp();	// 记录偏移 = 文件当前大小
-
-        // 两段式写：先写无效校验码整条，写完回写有效码（写一半崩溃 → 校验码无效，重建时截断）
-        file.seekp(offset);
-        char broken = CHECK_BROKEN;
-        file.write(&broken, CODE_LEN);
-        file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-        file.write((char*)&updateUS, UPDATE_TIME_LEN);
-        file.write((char*)&expireUS, EXPIRE_TIME_LEN);
-        file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
-        file.write(typeBuf, TYPE_LEN);
-        file.write(nameBuf, NAME_LEN);
-        file.write(bytes.data(), dataSize);
-        file.seekp(offset);		// 回写有效校验码
-        char valid = CHECK_VALID;
-        file.write(&valid, CODE_LEN);
-
-        /* ========== 更新disk的大小记录 =========== */
-        // 同名变量可能有多条记录（旧版本），inDisk 指向最新一条；重建时同名覆盖，旧记录成空洞
-        inDisk[varName] = offset;
-        curSize += recLen;	// 只增不减：空洞/已删数据不回收，重写时重新统计
-        return SUCCESS;
+        // 组装 + 整条一次写（校验已在上方完成；IO 类失败由末尾统一 flush 检查兜底）
+        return appendRecord(varName, val);
     };
 
     /* ========== 循环写入 =========== */
@@ -428,20 +336,22 @@ int Disk::persisData(std::vector<std::string> varNameSet)
         }
     }
 
-    file.flush();
-    if (!file) {
-        // 批量写失败：已清的 isDirty 全部置回 true，等待下次重刷
-        {
-            c->rwMutex->lock();
-            for (const auto& n : clearedNames) {
-                auto it = c->cache_db.find(n);
-                if (it != c->cache_db.end()) {
-                    it->second.isDirty = true;
+    if (file.is_open()) {
+        file.flush();	// 整批一次 flush
+        if (!file) {
+            // 批量写失败：已清的 isDirty 全部置回 true，等待下次重刷
+            {
+                c->rwMutex->lock();
+                for (const auto& n : clearedNames) {
+                    auto it = c->cache_db.find(n);
+                    if (it != c->cache_db.end()) {
+                        it->second.isDirty = true;
+                    }
                 }
+                c->rwMutex->unlock();
             }
-            c->rwMutex->unlock();
+            return UNKNOWN_ERROR;	// 写入失败
         }
-        return UNKNOWN_ERROR;	// 写入失败
     }
     return firstError;
 }
@@ -663,12 +573,9 @@ int Disk::reWrite()
         c->rwMutex->unlock();
     }
 
-    // 确保文件存在（in|out 模式打不开不存在的文件）
-    std::ofstream touch(dbName, std::ios::binary | std::ios::app);
-    touch.close();
-
-    std::fstream file(dbName, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file) return FILE_OPEN_FILED;	// 文件打开失败
+    // 复用常驻句柄（惰性打开/异常重建见 ensureFileOpen），本函数内读写与截断都走同一句柄
+    if (!ensureFileOpen()) return FILE_OPEN_FILED;	// 文件打开失败
+    std::fstream& file = this->file;
 
     // 写游标，写永远不覆盖未重写记录
     int writePos = 0;
@@ -697,20 +604,7 @@ int Disk::reWrite()
         if (reg == typeReg.end()) return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
         if (val.typeName.size() > TYPE_LEN) return LONG_NAME;
 
-        /* ========== 序列化 =========== */
-        std::vector<char> bytes = reg->second.first(*val.entity);	// 实体序列化字节
-        int dataSize = (int)bytes.size();
-        int recLen = CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN + dataSize;
-
-        // 时间信息：updateTime 已是 µs 整数（relaxed 原子），直接取，不再与 std::chrono 互转
-        long long updateUS = val.updateTime.load(std::memory_order_relaxed);
-        long long expireUS = val.isPermanent ? 0
-            : std::chrono::duration_cast<std::chrono::microseconds>(val.expireTime.time_since_epoch()).count();
-
-        char typeBuf[TYPE_LEN] = { 0 };
-        memcpy(typeBuf, val.typeName.c_str(), val.typeName.size());
-        char nameBuf[NAME_LEN] = { 0 };
-        memcpy(nameBuf, name.c_str(), name.size());
+        /* ========== 组装 + 写到紧凑位置（原地重写，不是追加） =========== */
 
         // 先清 isDirty（写锁内，与持久化一致：写文件期间缓存被改会重新置脏，不被误清）
         {
@@ -722,17 +616,23 @@ int Disk::reWrite()
             c->rwMutex->unlock();
         }
 
-        /* ========== 写到紧凑位置（原地重写，不是追加） =========== */
+        // 整条记录组装进 recBuf（定长头 + 实体直写缓冲，校验码直接置 CHECK_VALID——原地重写无需两段式）
+        int dataSize = 0;
+        int code = buildRecord(name, val, CHECK_VALID, dataSize);
+        if (code != SUCCESS) {
+            // 组装失败：isDirty 置回 true，等待下次重刷
+            c->rwMutex->lock();
+            auto it = c->cache_db.find(name);
+            if (it != c->cache_db.end()) {
+                it->second.isDirty = true;
+            }
+            c->rwMutex->unlock();
+            return code;
+        }
+
+        // 整条一次写（不覆盖未重写记录：写游标只前进）
         file.seekp(writePos);
-        char valid = CHECK_VALID;
-        file.write(&valid, CODE_LEN);
-        file.write((char*)&dataSize, ENTITY_SIZE_LEN);
-        file.write((char*)&updateUS, UPDATE_TIME_LEN);
-        file.write((char*)&expireUS, EXPIRE_TIME_LEN);
-        file.write((char*)&val.isPermanent, IS_PERMANENT_LEN);
-        file.write(typeBuf, TYPE_LEN);
-        file.write(nameBuf, NAME_LEN);
-        file.write(bytes.data(), dataSize);
+        file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
         if (!file) {
             c->rwMutex->lock();
             auto it = c->cache_db.find(name);
@@ -744,7 +644,7 @@ int Disk::reWrite()
         }
         // 偏移更新为紧凑位置，写游标前进
         inDisk[name] = writePos;
-        writePos += recLen;
+        writePos += static_cast<int>(recBuf.size());
         return SUCCESS;
     };
 

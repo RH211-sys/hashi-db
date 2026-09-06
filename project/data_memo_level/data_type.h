@@ -10,6 +10,7 @@
 #include <any>
 #include <chrono>
 #include <atomic>
+#include <ostream>
 #include <sstream>
 #include <memory>
 #include "protocol.h"
@@ -26,24 +27,20 @@
 inline std::unordered_set<std::string> totalType;
 
 /* ========== 类型注册表 ========== */
-// 序列化函数：把 any 里的对象打成字节（写盘用）
-using SerializeFunc = std::vector<char>(*)(const std::any& obj);
+// 序列化函数：把 any 里的对象直接写入调用方提供的输出流（写盘用）
+// 目标流由磁盘模块指向"定长头 + 实体"的连续记录缓冲 → 序列化零中间拷贝、一次 write 落盘
+using SerializeFunc = void(*)(const std::any& obj, std::ostream& os);
 // 反序列化函数：把字节还原成对象，包进 any（读盘用）
 using DeserializeFunc = std::any(*)(const std::vector<char>& bytes);
 
 // 类型注册表：typeName → {序列化函数, 反序列化函数}，程序启动注册，运行期只读
 inline std::unordered_map<std::string, std::pair<SerializeFunc, DeserializeFunc>> typeReg;
 
-// 序列化：cereal 把对象写入内存流，取出字节
+// 序列化：cereal 把对象直接写入调用方输出流（连续记录缓冲），免 stringstream 中间拷贝
 template <typename T>
-std::vector<char> toBytes(const std::any& obj) {
-    std::stringstream ss;
-    {
-        cereal::BinaryOutputArchive ar(ss);
-        ar(std::any_cast<const T&>(obj));
-    }
-    std::string s = ss.str();
-    return std::vector<char>(s.begin(), s.end());
+void toBytes(const std::any& obj, std::ostream& os) {
+    cereal::BinaryOutputArchive ar(os);
+    ar(std::any_cast<const T&>(obj));
 }
 
 // 反序列化：从字节还原对象，包进 any
