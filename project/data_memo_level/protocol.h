@@ -17,10 +17,10 @@ const int FILE_OPEN_FILED = 500; // 文件打开失败
 
 
 /* ========== 磁盘协议 ========== */
-const char CHECK_VALID   = 0x5A;	// 活记录（数据完整）
-const char CHECK_DELETED = 0xFF;	// 已删/空洞段：删除即空洞（1 字节删除标记）；顺序扫描按 dataSize 跳过、段可复用
+const char CHECK_VALID   = static_cast<char>(0x5A);	// 活记录（数据完整）
+const char CHECK_DELETED = static_cast<char>(0xFF);	// 已删/空洞段：删除即空洞（1 字节删除标记）；顺序扫描按 dataSize 跳过、段可复用
 									//   见 doc/arch/data_memo_doc/实现阶段/二轮优化/空洞删除段设计.md
-const char CHECK_BROKEN  = 0x00;	// 残尾（写一半崩溃）：重建时截断到此处
+const char CHECK_BROKEN  = static_cast<char>(0x00);	// 残尾（写一半崩溃）：重建时截断到此处
 const int NAME_LEN = 32;			// 变量名定长上限（写不满补 '\0'，超过返回失败）
 const int TYPE_LEN = 32;			// 类型名定长上限（写不满补 '\0'）
 const int CODE_LEN = 1;				// 校验码长度

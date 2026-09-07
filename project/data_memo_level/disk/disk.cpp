@@ -46,10 +46,12 @@ namespace {
     constexpr std::size_t HEAD_NAME = HEAD_TYPE + TYPE_LEN;
     constexpr std::size_t HEAD_SIZE = HEAD_NAME + NAME_LEN;
 
-    // 磁盘读失败抽样打印（探针：只打印前若干次，输出 ASCII）
+    // 磁盘读失败抽样打印（探测，已用 /* */ 注释保留；如需恢复把注释展开）
     // codeByte/recSize 未知时传 -1；fileLen 现场量取
     void reportSelFail(const std::string& dbName, const char* kind, const std::string& key,
         long long offset, int codeByte, long long recSize) {
+        (void)dbName; (void)kind; (void)key; (void)offset; (void)codeByte; (void)recSize;
+        /*
         static std::atomic<int> remain{ 10 };
         if (remain.fetch_sub(1) <= 0) return;
         long long fileLen = -1;
@@ -59,10 +61,13 @@ namespace {
         }
         std::cout << "[SEL-FAIL] kind=" << kind << " key=" << key << " offset=" << offset
             << " codeByte=" << codeByte << " recSize=" << recSize << " fileLen=" << fileLen << std::endl;
+        */
     }
 
-    // 压缩(reWrite)失败点定位打印（独立额度，诊断用；诊断完可移除）
+    // 压缩(reWrite)失败点定位打印（探测，已用 /* */ 注释保留；诊断用，如需恢复把注释展开）
     void reportRewriteFail(const std::string& dbName, const char* why, const std::string& key, long long off, long long recLen = -1) {
+        (void)dbName; (void)why; (void)key; (void)off; (void)recLen;
+        /*
         static std::atomic<int> remain{ 30 };
         if (remain.fetch_sub(1) <= 0) return;
         long long fileLen = -1;
@@ -72,6 +77,7 @@ namespace {
         }
         std::cout << "[REWRITE-FAIL] why=" << why << " key=" << key << " off=" << off
             << " recLen=" << recLen << " fileLen=" << fileLen << std::endl;
+        */
     }
 }
 
