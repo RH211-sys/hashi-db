@@ -5,22 +5,23 @@
 首轮：
 
 ```
-================== START (performance benchmark) ==================
-[prewarm [1] QPS - read-only] pool 2 keys, 1 MB, writing & flushing to disk...
-[prewarm done] load running for 30s
+======== START (performance benchmark, write-inflight edition) ========
+[prewarm [1] QPS - read-only] pool 344 keys, 101 MB, writing & flushing to disk...
+[prewarm done] load running for 30s (WRITE_INFLIGHT=4)
+[read-only] hot subset 344 keys / 101 MB (memory-hit reads; cold/disk reads -> hit-rate scenes)
 ===== [1] QPS - read-only (duration 30s) =====
-  requests: 24654850 | QPS 821828
-  latency(us): mean 9 | P50 8 | P99 39 | P999 131
-[prewarm [2] QPS - read70/write30] pool 2 keys, 1 MB, writing & flushing to disk...
-[prewarm done] load running for 30s
-===== [2] QPS - read80/write20 (duration 30s) =====
-  requests: 3482876 | QPS 116095
-  latency(us): mean 68 | P50 9 | P99 1983 | P999 4760
-[prewarm [3] QPS - write-only] pool 2 keys, 1 MB, writing & flushing to disk...
-[prewarm done] load running for 30s
+QPS 650117 | P99 62 us | hit rate 100%
+
+[prewarm [2] QPS - read70/write30] pool 344 keys, 101 MB, writing & flushing to disk...
+[prewarm done] load running for 30s (WRITE_INFLIGHT=4)
+===== [2] QPS - read70/write30 (duration 30s) =====
+QPS 361925 | P99 643 us | hit rate 100%
+
+[prewarm [3] QPS - write-only] pool 344 keys, 101 MB, writing & flushing to disk...
+[prewarm done] load running for 30s (WRITE_INFLIGHT=4)
 ===== [3] QPS - write-only (duration 30s) =====
-  requests: 950809 | QPS 31693
-  latency(us): mean 252 | P50 16 | P99 4387 | P999 19967
+QPS 145117 | P99 705 us | hit rate 0%
+======== END ========
 ```
 
 ![enough](image/cache_enough.jpg)
@@ -65,4 +66,4 @@
 ================== END, total 60s ==================
 ```
 
-![cache_hit](/image/cache_hit.jpg)
+![cache_hit](image/cache_hit.jpg)
