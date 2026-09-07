@@ -46,10 +46,13 @@ namespace {
     constexpr std::size_t HEAD_NAME = HEAD_TYPE + TYPE_LEN;
     constexpr std::size_t HEAD_SIZE = HEAD_NAME + NAME_LEN;
 
-    // 磁盘读失败抽样打印（探针：只打印前若干次，输出 ASCII）
+#if 0
+    // 磁盘读失败抽样打印（探测，已用 /* */ 注释保留；如需恢复把注释展开）
     // codeByte/recSize 未知时传 -1；fileLen 现场量取
     void reportSelFail(const std::string& dbName, const char* kind, const std::string& key,
         long long offset, int codeByte, long long recSize) {
+        (void)dbName; (void)kind; (void)key; (void)offset; (void)codeByte; (void)recSize;
+        /*
         static std::atomic<int> remain{ 10 };
         if (remain.fetch_sub(1) <= 0) return;
         long long fileLen = -1;
@@ -59,10 +62,13 @@ namespace {
         }
         std::cout << "[SEL-FAIL] kind=" << kind << " key=" << key << " offset=" << offset
             << " codeByte=" << codeByte << " recSize=" << recSize << " fileLen=" << fileLen << std::endl;
+        */
     }
 
-    // 压缩(reWrite)失败点定位打印（独立额度，诊断用；诊断完可移除）
+    // 压缩(reWrite)失败点定位打印（探测，已用 /* */ 注释保留；诊断用，如需恢复把注释展开）
     void reportRewriteFail(const std::string& dbName, const char* why, const std::string& key, long long off, long long recLen = -1) {
+        (void)dbName; (void)why; (void)key; (void)off; (void)recLen;
+        /*
         static std::atomic<int> remain{ 30 };
         if (remain.fetch_sub(1) <= 0) return;
         long long fileLen = -1;
@@ -72,7 +78,9 @@ namespace {
         }
         std::cout << "[REWRITE-FAIL] why=" << why << " key=" << key << " off=" << off
             << " recLen=" << recLen << " fileLen=" << fileLen << std::endl;
+        */
     }
+#endif
 }
 
 
@@ -117,13 +125,17 @@ int Disk::buildRecord(const std::string& varName, const Val& val, char code, int
     // 定长头占位（全零 = 0x00，恰为 CHECK_BROKEN），实体字节随后直接序列化进同一缓冲
     recBuf.clear();
     recBuf.resize(HEAD_SIZE);
+#if 0
     auto t0 = std::chrono::steady_clock::now();
+#endif
     {
         VecStream os(recBuf);
         reg->second.first(*val.entity, os);	// 实体字节追加到 recBuf[HEAD_SIZE..]，零中间拷贝
     }
+#if 0
     statBuildUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);	// 组装（序列化）耗时记账
+#endif
     dataSize = static_cast<int>(recBuf.size() - HEAD_SIZE);	// 数据大小：只含实体
 
     // 时间信息（updateTime 已是 µs 整数；expireTime 仍为 time_point）
@@ -163,11 +175,15 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     if (maxSize > 0 && curSize + static_cast<long long>(recBuf.size()) > maxSize) {
         flushSync();
         if (!file) return UNKNOWN_ERROR;
+#if 0
         statCompactCnt.fetch_add(1, std::memory_order_relaxed);	// 观测：自动压缩次数
+#endif
         code = reWrite();
         if (code != SUCCESS) {	// 压缩失败：文件可能半新半旧（陈旧偏移的来源），本次追加中止
+#if 0
             statCompactFail.fetch_add(1, std::memory_order_relaxed);
             reportSelFail(dbName, "compact-fail", varName, 0, code, -1);
+#endif
             return code;
         }
         code = buildRecord(varName, val, CHECK_BROKEN, dataSize);
@@ -176,7 +192,9 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     }
 
     // 一律追加写：旧记录无法保证长度一致，覆盖会产生碎片，留空洞等重写回收
+#if 0
     auto t1 = std::chrono::steady_clock::now();
+#endif
     file.seekp(0, std::ios::end);
     std::streamoff offset = file.tellp();	// 记录偏移 = 文件当前大小
     if (!file) { file.clear(); return UNKNOWN_ERROR; }
@@ -186,11 +204,26 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
     file.seekp(offset);						// 回写有效校验码
     char valid = CHECK_VALID;
     file.write(&valid, CODE_LEN);
-    if (!file) return UNKNOWN_ERROR;
+    if (!file) {
+        // 写失败：本条可能已在文件里残留半写内容（超过写入前 offset）——
+        // 先清 badbit，把缓冲里"此前已入 inDisk 的记录"落盘，再截断回写入前偏移，残渣不留；
+        // flush 也失败（如盘仍满）则不清缓冲，交调用方"脏标记恢复 + 重试追加"自愈，不强截断
+        file.clear();
+        file.flush();
+        if (file) {
+            std::error_code ec;
+            std::filesystem::resize_file(dbName, static_cast<uintmax_t>(offset), ec);	// 截掉半条残渣
+        } else {
+            file.clear();
+        }
+        return UNKNOWN_ERROR;
+    }
+#if 0
     statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);	// 文件写耗时记账
     statWriteCnt.fetch_add(1, std::memory_order_relaxed);
     statWriteBytes.fetch_add(static_cast<long long>(recBuf.size()), std::memory_order_relaxed);
+#endif
 
     // 该 key 若之前已有磁盘记录（被新版本取代）：旧槽显式标记空洞并登记（防 loader 复活旧值、洞可复用）
     auto oldIt = inDisk.find(varName);
@@ -205,27 +238,35 @@ int Disk::appendRecord(const std::string& varName, const Val& val)
 void Disk::flushSync()
 {
     // flush 并记账（写路径共用：单条持久化/批量末尾/重写末尾）
+#if 0
     auto t0 = std::chrono::steady_clock::now();
+#endif
     file.flush();
+#if 0
     statFlushUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
     statFlushCnt.fetch_add(1, std::memory_order_relaxed);
+#endif
 }
 
 void Disk::addHole(long long offset, long long capacity)
 {
     // 登记空闲段（仅磁盘线程调用）；容量 = 86 + dataSize，best-fit 取用
     holes.emplace(capacity, offset);
+#if 0
     statHoleCnt.fetch_add(1, std::memory_order_relaxed);
     statHoleBytes.fetch_add(capacity, std::memory_order_relaxed);
+#endif
 }
 
 void Disk::clearHoles()
 {
     // 压缩成功/重建后：紧凑文件无洞
     if (!holes.empty()) holes.clear();
+#if 0
     statHoleCnt.store(0, std::memory_order_relaxed);
     statHoleBytes.store(0, std::memory_order_relaxed);
+#endif
 }
 
 void Disk::markDeleted(long long offset)
@@ -268,7 +309,9 @@ bool Disk::tryOverwriteInPlace(const std::string& varName)
     long long remain = oldTotal - newTotal;
     if (remain != 0 && remain < HEAD_SIZE) return false;	// 剩余不足一个洞头：链会断 → 回退追加
 
+#if 0
     auto t1 = std::chrono::steady_clock::now();
+#endif
     // 两段式覆盖：recBuf 头为 BROKEN → 整条写 → 回写 VALID
     file.seekp(oldOff);
     file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
@@ -285,19 +328,25 @@ bool Disk::tryOverwriteInPlace(const std::string& varName)
         file.write((char*)&sz, ENTITY_SIZE_LEN);
     }
     if (!file) {
-        // 覆盖失败：恢复旧校验码，保持文件可解析（被覆盖内容不再被引用）
+        // 覆盖写失败：槽可能已被半写污染 → 把旧头（code + 旧 dataSize）写回原位置，
+        // 槽恢复为"长度 = 旧槽"的自描述记录（body 内容混合旧/新，链不会断，
+        // 等下次成功刷盘以新版本取代/标洞即可）——不能只恢复 code：dataSize 若被新值
+        // 覆盖，槽长改变会让顺序扫描/loader 错位
         file.clear();
         file.seekp(oldOff);
         file.write(&oldCheck, CODE_LEN);
+        file.write((char*)&oldDataSize, ENTITY_SIZE_LEN);
         return false;
     }
     if (remain >= HEAD_SIZE) addHole(oldOff + newTotal, remain);	// 登记剩余洞
+#if 0
     statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);
     statWriteCnt.fetch_add(1, std::memory_order_relaxed);
     statOverwriteCnt.fetch_add(1, std::memory_order_relaxed);
     if (remain == 0) statOverwriteSame.fetch_add(1, std::memory_order_relaxed);
     else statOverwriteShrink.fetch_add(1, std::memory_order_relaxed);
+#endif
     return true;	// inDisk/curSize 不变；flush 由调用方批处理
 }
 
@@ -311,11 +360,15 @@ bool Disk::tryUseHole(const std::string& varName)
     long long cap = it->first;
     long long off = it->second;
     holes.erase(it);
+#if 0
     statHoleCnt.fetch_sub(1, std::memory_order_relaxed);
     statHoleBytes.fetch_sub(cap, std::memory_order_relaxed);
+#endif
 
     if (!ensureFileOpen()) { addHole(off, cap); return false; }	// 句柄不可用：洞放回索引
+#if 0
     auto t1 = std::chrono::steady_clock::now();
+#endif
     // 两段式写：recBuf 头为 BROKEN → 整条写 → 回写 VALID
     file.seekp(off);
     file.write(recBuf.data(), static_cast<std::streamsize>(recBuf.size()));
@@ -349,10 +402,12 @@ bool Disk::tryUseHole(const std::string& varName)
     auto oldIt = inDisk.find(varName);
     if (oldIt != inDisk.end() && oldIt->second != off) markDeleted(oldIt->second);
     inDisk[varName] = off;
+#if 0
     statFileUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t1).count()), std::memory_order_relaxed);
     statWriteCnt.fetch_add(1, std::memory_order_relaxed);
     statHoleUseCnt.fetch_add(1, std::memory_order_relaxed);
+#endif
     return true;	// curSize 不变（写入已有洞，文件不增长）；flush 由调用方批处理
 }
 
@@ -360,6 +415,7 @@ DiskIoStat Disk::getIoStat() const
 {
     // 观测快照：relaxed 读即可（累加值，不强一致）
     DiskIoStat s;
+#if 0
     s.writeCnt = statWriteCnt.load(std::memory_order_relaxed);
     s.writeBytes = statWriteBytes.load(std::memory_order_relaxed);
     s.buildUs = statBuildUs.load(std::memory_order_relaxed);
@@ -388,6 +444,7 @@ DiskIoStat Disk::getIoStat() const
     s.holeCnt = statHoleCnt.load(std::memory_order_relaxed);
     s.holeBytes = statHoleBytes.load(std::memory_order_relaxed);
     s.holeUseCnt = statHoleUseCnt.load(std::memory_order_relaxed);
+#endif
     return s;
 }
 
@@ -671,24 +728,32 @@ int Disk::persisAll()
 
 int Disk::selData(const std::string& varName, std::any& res, Val& val)
 {
+#if 0
     statSelCalls.fetch_add(1, std::memory_order_relaxed);	// 观测：进入（缓存未命中 → 磁盘读）
+#endif
 
     /* ========== 查内存索引 =========== */
     auto it = inDisk.find(varName);
     if (it == inDisk.end()) {
+#if 0
         statSelInDiskMiss.fetch_add(1, std::memory_order_relaxed);	// 观测：未开文件即缺失（含"已淘汰未落盘"瞬态与真不存在）
+#endif
         return FIND_FAILED;	// 磁盘没有该数据
     }
     long long offset = it->second;
 
     // 读耗时观测起点（含文件开关 + 读记录 + 反序列化，成功读回才记账）
+#if 0
     auto t0 = std::chrono::steady_clock::now();
+#endif
 
     /* ========== 打开文件读取（复用常驻读写句柄，免每次 open/close） =========== */
     if (!ensureFileOpen()) {
+#if 0
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailOpen.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "open", varName, offset, -1, -1);	// 文件打开失败
+#endif
         return FILE_OPEN_FILED;
     }
 
@@ -698,10 +763,12 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     file.read(&check, CODE_LEN);
     if (!file || check != CHECK_VALID) {
         // 首字节校验码不符 / 头读失败（offset 越界或错位）——抽样打印现场
+#if 0
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailCheck.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "check", varName, offset,
             static_cast<int>(static_cast<unsigned char>(check)), -1);
+#endif
         return FIND_FAILED;	// 校验码无效：数据不完整
     }
 
@@ -722,9 +789,11 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
 
     // 记录里的变量名应与查询名一致（防偏移错乱）
     if (memcmp(nameBuf, varName.c_str(), varName.size()) != 0) {
+#if 0
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailName.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "name", varName, offset, -1, dataSize);
+#endif
         return FIND_FAILED;
     }
 
@@ -732,9 +801,11 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     std::vector<char> bytes(dataSize);
     file.read(bytes.data(), dataSize);
     if (!file) {
+#if 0
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailEof.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "eof", varName, offset, -1, dataSize);	// 实体区读超 EOF
+#endif
         return FIND_FAILED;	// 读取失败（数据不完整）
     }
 
@@ -742,9 +813,11 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     std::string typeName(typeBuf);	// 截到 '\0'
     auto reg = typeReg.find(typeName);
     if (reg == typeReg.end()) {
+#if 0
         statSelFileFail.fetch_add(1, std::memory_order_relaxed);
         statSelFailType.fetch_add(1, std::memory_order_relaxed);
         reportSelFail(dbName, "type", varName, offset, -1, dataSize);	// 类型未注册
+#endif
         return TYPE_VALID;	// 类型未注册（忘了 DEFINE_DATA_TYPE）
     }
     res = reg->second.second(bytes);	// 反序列化 → any
@@ -757,10 +830,12 @@ int Disk::selData(const std::string& varName, std::any& res, Val& val)
     val.expireTime = val.isPermanent
         ? std::chrono::system_clock::time_point(std::chrono::microseconds(updateUS))
         : std::chrono::system_clock::time_point(std::chrono::microseconds(expireUS));
+#if 0
     statReadUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);	// 磁盘读耗时记账
     statReadCnt.fetch_add(1, std::memory_order_relaxed);
     statSelOk.fetch_add(1, std::memory_order_relaxed);	// 观测：读盘成功
+#endif
     return SUCCESS;
 }
 
@@ -888,9 +963,11 @@ int Disk::reWrite()
     //          写游标不再需要保护未读数据，可安全覆盖/追加。
     // 为何两阶段：若把"会变大的缓存写"与"读旧搬移"按偏移交错进行，变大的写会造成写游标前跳，
     // 盖掉后面还没读的旧记录（写覆盖读）→ read-head 失败/索引陈旧（见此前 debug 记录）。
+#if 0
     // —— 压缩观测起点：耗时 + 压缩前文件大小（评估空洞回收，方向1）——
     auto compactT0 = std::chrono::steady_clock::now();
     const long long compactBeforeBytes = curSize;
+#endif
 
     auto c = cache.lock();
     if (!c) return UNKNOWN_ERROR;	// 缓存未绑定或已析构
@@ -949,7 +1026,9 @@ int Disk::reWrite()
         file.read(&check, CODE_LEN);
         file.read((char*)&dataSize, ENTITY_SIZE_LEN);
         if (!file || check != CHECK_VALID) {
+#if 0
             reportRewriteFail(dbName, "read-head", name, offset);
+#endif
             return UNKNOWN_ERROR;	// 旧文件异常（健康文件不会走到这里）
         }
         long long recLen = static_cast<long long>(CODE_LEN + ENTITY_SIZE_LEN + TIME_INFO_LEN + TYPE_LEN + NAME_LEN) + dataSize;
@@ -957,7 +1036,9 @@ int Disk::reWrite()
         file.seekg(offset);
         file.read(buf.data(), static_cast<std::streamsize>(recLen));
         if (!file) {
+#if 0
             reportRewriteFail(dbName, "read-rec", name, offset, recLen);
+#endif
             return UNKNOWN_ERROR;
         }
 
@@ -965,7 +1046,9 @@ int Disk::reWrite()
         file.seekp(writePos);
         file.write(buf.data(), static_cast<std::streamsize>(recLen));
         if (!file) {
+#if 0
             reportRewriteFail(dbName, "write-rec", name, writePos, recLen);
+#endif
             return UNKNOWN_ERROR;
         }
         inDisk[name] = writePos;
@@ -1022,7 +1105,9 @@ int Disk::reWrite()
             continue;
         }
         if (code != SUCCESS) {
+#if 0
             reportRewriteFail(dbName, "cache", name, -1);
+#endif
             return code;	// 组装/写入失败：重写中断（与既有语义一致，交运维）
         }
     }
@@ -1042,7 +1127,9 @@ int Disk::reWrite()
         int code = writeFromCache(name);
         // FIND_FAILED = 收集后并发被删（淘汰落盘已排队），不写即可
         if (code != SUCCESS && code != FIND_FAILED) {
+#if 0
             reportRewriteFail(dbName, "cache-new", name, -1);
+#endif
             return code;
         }
     }
@@ -1053,14 +1140,16 @@ int Disk::reWrite()
     // 全部完成后截断到写游标位置（清掉空洞/已删数据），重写后 curSize 重新统计
     std::error_code ec;
     std::filesystem::resize_file(dbName, writePos, ec);
-    if (ec) { reportRewriteFail(dbName, "resize", "", -1); return UNKNOWN_ERROR; }	// 截断失败
+    if (ec) { return UNKNOWN_ERROR; }	// 截断失败
 
     curSize = writePos;
     clearHoles();	// 紧凑文件无洞：清空洞索引（此前登记的洞已被压缩回收）
     // —— 压缩观测记账（仅成功路径；失败由调用方 compactFail 计数）——
+#if 0
     statCompactUs.fetch_add(static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - compactT0).count()), std::memory_order_relaxed);
     statCompactBefore.fetch_add(compactBeforeBytes, std::memory_order_relaxed);
     statCompactAfter.fetch_add(writePos, std::memory_order_relaxed);
+#endif
     return SUCCESS;
 }

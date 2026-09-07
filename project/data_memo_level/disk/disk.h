@@ -63,6 +63,8 @@ private:
 	std::fstream file;			// 常驻文件句柄（读+写：所有持久化/重写复用，免每次 open/close）
 	std::vector<char> recBuf;	// 单条记录组装缓冲（定长头 + 实体字节，序列化直写、整条一次落盘）
 
+	// ===== 观测统计（性能归因探针，已用 #if 0 禁用；恢复观测删除 #if 0 / #endif 两行即可）=====
+#if 0
 	// 观测统计（relaxed 累加，磁盘线程单侧写，测试侧读）
 	std::atomic<long long> statWriteCnt{ 0 };
 	std::atomic<long long> statWriteBytes{ 0 };
@@ -93,6 +95,7 @@ private:
 	std::atomic<long long> statHoleCnt{ 0 };	// 当前空洞段数（快照用）
 	std::atomic<long long> statHoleBytes{ 0 };	// 当前空洞总字节（快照用，含 86B 头）
 	std::atomic<long long> statHoleUseCnt{ 0 };	// 空洞复用次数（累计）
+#endif
 
 	// ===== 空洞（删除=空洞，见 空洞删除段设计.md）=====
 	// 空闲段索引：按容量升序 (容量=86+dataSize, 偏移)，best-fit 取用；仅磁盘线程读写
