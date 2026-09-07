@@ -256,19 +256,23 @@ private:
 	int upEdge = 15;			// 差距上限：缓存任务堆积到上限时，若有磁盘任务则让位调度一个
 	int lowEdge = -5;			// 差距下限：磁盘任务处理过多时，重置差距
 	bool stop = false;								// 停止标志（析构时置位）
+#if 0
 	// 观测统计（relaxed，供性能归因）：队列积压与 worker 忙碌占比
 	std::atomic<long long> statPushCnt{ 0 };	// 提交（push/submit）次数
 	std::atomic<long long> statDepthSum{ 0 };	// 提交时双队列总深度累加
 	std::atomic<long long> statDepthMax{ 0 };	// 提交时队列深度峰值
 	std::atomic<long long> statRunCnt{ 0 };		// worker 已执行任务数
 	std::atomic<long long> statBusyUs{ 0 };		// worker 执行任务总耗时（µs）
+#endif
 	// 提交观测记账（须持锁调用：队列 size 读安全）：push 次数 / 深度累加 / 峰值
 	void notePush() {
+#if 0
 		statPushCnt.fetch_add(1, std::memory_order_relaxed);
 		long long depth = static_cast<long long>(diskTasks.size() + cacheTasks.size());
 		statDepthSum.fetch_add(depth, std::memory_order_relaxed);
 		long long maxD = statDepthMax.load(std::memory_order_relaxed);
 		if (depth > maxD) statDepthMax.store(depth, std::memory_order_relaxed);
+#endif
 	}
 
 	// 线程入口：取任务 -> 执行回调 -> 继续取，直到停止且队列清空
@@ -302,18 +306,22 @@ private:
 					continue;	// 理论不可达：wait 已保证队列非空
 				}
 			}
+#if 0
 			auto runT0 = std::chrono::steady_clock::now();	// worker 执行耗时观测起点
+#endif
 			try {
 				task();	// 锁外执行回调，磁盘 IO 全程锁外
 			}
 			catch (...) {
 				// 磁盘任务异常不致命：吞掉继续干活，避免磁盘线程死亡
 			}
+#if 0
 			statBusyUs.fetch_add(static_cast<long long>(
 				std::chrono::duration_cast<std::chrono::microseconds>(
 					std::chrono::steady_clock::now() - runT0).count()),
 				std::memory_order_relaxed);
 			statRunCnt.fetch_add(1, std::memory_order_relaxed);
+#endif
 		}
 	}
 
@@ -386,12 +394,14 @@ public:
 	// 观测快照：提交次数 / 平均与峰值队列深度 / worker 执行任务数与总耗时
 	DiskQueueStat getQueueStat() const {
 		DiskQueueStat s;
+#if 0
 		s.pushCnt = statPushCnt.load(std::memory_order_relaxed);
 		s.maxDepth = statDepthMax.load(std::memory_order_relaxed);
 		s.avgDepth = (s.pushCnt > 0)
 			? static_cast<double>(statDepthSum.load(std::memory_order_relaxed)) / s.pushCnt : 0.0;
 		s.runCnt = statRunCnt.load(std::memory_order_relaxed);
 		s.busyUs = statBusyUs.load(std::memory_order_relaxed);
+#endif
 		return s;
 	}
 };

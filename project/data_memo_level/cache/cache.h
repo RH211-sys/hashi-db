@@ -76,7 +76,7 @@ private:
 	std::shared_ptr<ReadPool> readPool;		// 读线程池（由上层注入，共享所有权），缓存读任务并发执行
 	long long memoSize;	// 缓存大小设定值
 	long long curSize;	// 当前缓存大小
-	std::unordered_map<std::string, Val> cache_db;      // <变量名，值>
+	std::unordered_map<std::string, Val> cache_db;      // 缓存数据存储<变量名，值>
 	std::unique_ptr<WritePrefMutex> rwMutex;			// 缓存模块的写优先读写锁
 	// 运行统计（原子计数，供 getStat() 观测；命中/未命中在热路径 relaxed 自增，evict 只在写线程执行无争抢）
 	std::atomic<long long> statHit{ 0 };		// 命中次数（缓存中存在即命中，含过期）
