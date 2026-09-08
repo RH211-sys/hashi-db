@@ -63,8 +63,8 @@ private:
 	std::fstream file;			// 常驻文件句柄（读+写：所有持久化/重写复用，免每次 open/close）
 	std::vector<char> recBuf;	// 单条记录组装缓冲（定长头 + 实体字节，序列化直写、整条一次落盘）
 
-	// ===== 观测统计（性能归因探针，已用 #if 1 禁用；恢复观测删除 #if 1 / #endif 两行即可）=====
-#if 1
+	// ===== 观测统计（性能归因探针，已用 #if 0 禁用；恢复观测删除 #if 0 / #endif 两行即可）=====
+#if 0
 	// 观测统计（relaxed 累加，磁盘线程单侧写，测试侧读）
 	std::atomic<long long> statWriteCnt{ 0 };
 	std::atomic<long long> statWriteBytes{ 0 };

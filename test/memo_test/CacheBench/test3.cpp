@@ -338,7 +338,7 @@ static void printLoad(const char* title, const LoadResult& r, const CacheStat& s
 }
 
 // ============ 磁盘 IO 阶段占比输出（探针数据报告：#if 1 开启 / #if 0 关闭）============
-#if 1
+#if 0
 // 序列化 / 文件写 / flush / 磁盘读 / 队列积压与 worker 忙碌（占比按 RUN_SECONDS 计算）
 static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double seconds) {
 	double runMs = seconds * 1000.0;
@@ -415,7 +415,7 @@ static void qpsScene(const char* title, double readRate) {
 	LoadResult r = runLoad(db, loadPool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
 	CacheStat s = db.getStat();
 	printLoad(title, r, s, RUN_SECONDS);
-#if 1
+#if 0
 	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
 #endif
 }
@@ -439,7 +439,7 @@ static void hitRateScene(int times) {
 	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, log-normal 1K-10M)",
 		times, static_cast<long long>(poolBytes / 1024 / 1024));
 	printLoad(title, r, s, RUN_SECONDS);
-#if 1
+#if 0
 	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
 #endif
 }
