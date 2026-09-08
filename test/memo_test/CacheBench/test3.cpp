@@ -52,7 +52,7 @@
 //   - 80/20 热冷：缓存按"热集"而非全量定容（cache ≈ 热集字节 + 余量）。
 //   - 对比参考：Pika/SSD 型是"数据全落盘+内存小缓冲"，不是本项目的热冷分层模型。
 //   详见 doc/arch/data_memo_doc/实现阶段/二轮优化/（优化1.md / 测试比例讨论）
-constexpr long long MEMO_SIZE = 100LL * 1024 * 1024;	// 缓存 100M（1）
+constexpr long long MEMO_SIZE = 1000LL * 1024 * 1024;	// 缓存 100M（1）
 constexpr long long DISK_SIZE = 500LL * 1024 * 1024;	// 磁盘 500M（5，≥ 数据集 + 压缩/写放大余量）
 constexpr int POOL_THREADS = 8;							// 读/写线程池线程数
 constexpr int WRITE_INFLIGHT = 4;						// 每线程在途写请求数（窗口深度；=1 退化为 test2 同步写）
@@ -61,7 +61,7 @@ const std::string DB_NAME = "test3_data.dat";			// 数据文件
 //   QPS 正常档 300M（≈1:3:5）；命中率对照档 2x/3x(=200M/300M，对应 1:2:5 / 1:3:5)。
 //   唯一数据总量始终 ≤ 磁盘 500M，磁盘上限不被"不断新增的唯一数据"顶穿；
 //   热更新产生的版本 churn 由磁盘自动压缩回收，不计入唯一数据。
-constexpr long long WARM_BYTES = 300LL * 1024 * 1024;	// QPS 档数据集（预热池）300M
+constexpr long long WARM_BYTES = 30LL * 1024 * 1024;	// QPS 档数据集（预热池）300M
 constexpr int INJECT_KEYS = 60;							// 缓慢新增新 key：60 条（≈24MB，数据集 300→~324M，≈1:3.2:5）
 constexpr double RUN_SECONDS = 30.0;					// 每场景固定时长
 constexpr int WORKERS = 8;								// 压测线程数
@@ -453,9 +453,9 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	// qpsScene("[1] QPS - read-only", 1.0);
+	qpsScene("[1] QPS - read-only", 1.0);
 	qpsScene("[2] QPS - read70/write30", 0.7);		
-	// qpsScene("[3] QPS - write-only", 0.0);
+	qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
 	// hitRateScene(2);
