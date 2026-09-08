@@ -256,7 +256,7 @@ private:
 	int upEdge = 15;			// 差距上限：缓存任务堆积到上限时，若有磁盘任务则让位调度一个
 	int lowEdge = -5;			// 差距下限：磁盘任务处理过多时，重置差距
 	bool stop = false;								// 停止标志（析构时置位）
-#if 0
+#if 1
 	// 观测统计（relaxed，供性能归因）：队列积压与 worker 忙碌占比
 	std::atomic<long long> statPushCnt{ 0 };	// 提交（push/submit）次数
 	std::atomic<long long> statDepthSum{ 0 };	// 提交时双队列总深度累加
@@ -266,7 +266,7 @@ private:
 #endif
 	// 提交观测记账（须持锁调用：队列 size 读安全）：push 次数 / 深度累加 / 峰值
 	void notePush() {
-#if 0
+#if 1
 		statPushCnt.fetch_add(1, std::memory_order_relaxed);
 		long long depth = static_cast<long long>(diskTasks.size() + cacheTasks.size());
 		statDepthSum.fetch_add(depth, std::memory_order_relaxed);
@@ -306,7 +306,7 @@ private:
 					continue;	// 理论不可达：wait 已保证队列非空
 				}
 			}
-#if 0
+#if 1
 			auto runT0 = std::chrono::steady_clock::now();	// worker 执行耗时观测起点
 #endif
 			try {
@@ -315,7 +315,7 @@ private:
 			catch (...) {
 				// 磁盘任务异常不致命：吞掉继续干活，避免磁盘线程死亡
 			}
-#if 0
+#if 1
 			statBusyUs.fetch_add(static_cast<long long>(
 				std::chrono::duration_cast<std::chrono::microseconds>(
 					std::chrono::steady_clock::now() - runT0).count()),
@@ -394,7 +394,7 @@ public:
 	// 观测快照：提交次数 / 平均与峰值队列深度 / worker 执行任务数与总耗时
 	DiskQueueStat getQueueStat() const {
 		DiskQueueStat s;
-#if 0
+#if 1
 		s.pushCnt = statPushCnt.load(std::memory_order_relaxed);
 		s.maxDepth = statDepthMax.load(std::memory_order_relaxed);
 		s.avgDepth = (s.pushCnt > 0)

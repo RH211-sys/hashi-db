@@ -318,18 +318,27 @@ static LoadResult runLoad(Controller& db, const std::vector<PoolEntry>& pool,
 
 // ============ 输出 ============
 
-// 输出：只保留 QPS / P99 / 缓存命中率（探测性明细已移到其他分支）
+// 输出：详细数据报告（QPS + 延迟分位 + 命中率 + 淘汰统计；磁盘探针明细见 printDiskIo）
 static void printLoad(const char* title, const LoadResult& r, const CacheStat& s, double seconds) {
 	long long seen = s.hit + s.miss;
 	double hitRate = seen > 0 ? 100.0 * s.hit / seen : 0.0;
+	double runMs = seconds * 1000.0;
+	double evictAvgMs = s.evictCnt > 0 ? static_cast<double>(s.evictUs) / s.evictCnt / 1000.0 : 0.0;
+	double evictRatio = runMs > 0 ? 100.0 * (s.evictUs / 1000.0) / runMs : 0.0;
 	std::cout << "===== " << title << " (duration " << seconds << "s) =====" << std::endl;
-	std::cout << "  QPS " << static_cast<long long>(r.qps)
-		<< " | P99 " << static_cast<long long>(r.p99Us) << " us"
-		<< " | hit rate " << hitRate << "%" << std::endl;
+	std::cout << "  requests: " << r.total << " | QPS " << static_cast<long long>(r.qps) << std::endl;
+	std::cout << "  latency(us): mean " << static_cast<long long>(r.meanUs)
+		<< " | P50 " << static_cast<long long>(r.p50Us)
+		<< " | P99 " << static_cast<long long>(r.p99Us)
+		<< " | P999 " << static_cast<long long>(r.p999Us) << std::endl;
+	std::cout << "  cache: hit " << s.hit << " / miss " << s.miss
+		<< " -> hit rate " << hitRate << "%" << std::endl;
+	std::cout << "  evict: " << s.evictCnt << " calls / " << s.evictItems << " items"
+		<< " / avg " << evictAvgMs << " ms per call / evict-ratio " << evictRatio << "%" << std::endl;
 }
 
-// ============ 磁盘 IO 阶段占比输出（探测，已用 /* */ 注释：明细移到其他分支，展开即可恢复）============
-/*
+// ============ 磁盘 IO 阶段占比输出（探针数据报告：#if 1 开启 / #if 0 关闭）============
+#if 1
 // 序列化 / 文件写 / flush / 磁盘读 / 队列积压与 worker 忙碌（占比按 RUN_SECONDS 计算）
 static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double seconds) {
 	double runMs = seconds * 1000.0;
@@ -359,7 +368,7 @@ static void printDiskIo(const DiskIoStat& io, const DiskQueueStat& q, double sec
 		<< " | file " << (io.compactBefore / 1024 / 1024) << "MB -> " << (io.compactAfter / 1024 / 1024)
 		<< "MB (reclaim " << ((io.compactBefore - io.compactAfter) / 1024 / 1024) << "MB)" << std::endl;
 }
-*/	// 探测输出注释结束
+#endif
 
 // ============ 场景 ============
 
@@ -406,7 +415,9 @@ static void qpsScene(const char* title, double readRate) {
 	LoadResult r = runLoad(db, loadPool, readRate, true, RUN_SECONDS, readRate < 1.0 ? &injectPool : nullptr);
 	CacheStat s = db.getStat();
 	printLoad(title, r, s, RUN_SECONDS);
-	// printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);	// 探测输出（已注释）
+#if 1
+	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
+#endif
 }
 
 // 命中率档场景：总数据 = times 倍缓存，每条大小对数正态随机，纯读按冷热分布
@@ -428,7 +439,9 @@ static void hitRateScene(int times) {
 	std::snprintf(title, sizeof(title), "hit-rate %dx (total %lld MB, log-normal 1K-10M)",
 		times, static_cast<long long>(poolBytes / 1024 / 1024));
 	printLoad(title, r, s, RUN_SECONDS);
-	// printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);	// 探测输出（已注释）
+#if 1
+	printDiskIo(db.getIoStat(), db.getQueueStat(), RUN_SECONDS);
+#endif
 }
 
 // ============ main ============
@@ -440,13 +453,13 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	//qpsScene("[1] QPS - read-only", 1.0);
-	//qpsScene("[2] QPS - read70/write30", 0.7);		
-	//qpsScene("[3] QPS - write-only", 0.0);
+	// qpsScene("[1] QPS - read-only", 1.0);
+	qpsScene("[2] QPS - read70/write30", 0.7);		
+	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
-	hitRateScene(2);
-	hitRateScene(3);
+	// hitRateScene(2);
+	// hitRateScene(3);
 	// hitRateScene(4);	// 4x=400M（≈1:4:5）可选对照；跑全量会明显增加预热时长与 SSD 写入
 
 	std::filesystem::remove(DB_NAME);	// 清理本次测试数据文件
