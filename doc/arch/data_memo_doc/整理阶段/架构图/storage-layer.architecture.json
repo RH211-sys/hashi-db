@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "缓存中间件存储层架构（Cache + Disk 两级）",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "read-path",
+        "label": "读路径（命中 / miss 回填）",
+        "focus": ["caller", "controller", "cache", "readpool", "diskthread", "disk", "file"],
+        "note": "命中直接返回实体指针（零拷贝）；miss 交给 DiskThread 读盘并后台回填"
+      },
+      {
+        "id": "write-path",
+        "label": "写路径（标脏 / 淘汰 / 刷盘）",
+        "focus": ["caller", "controller", "cache", "writethread", "diskthread", "disk", "file"],
+        "note": "写只改缓存并标脏，批末刷盘；全局采样淘汰在写线程内阻塞执行"
+      },
+      {
+        "id": "durability",
+        "label": "持久化与崩溃一致性",
+        "focus": ["diskthread", "disk", "file", "typereg"],
+        "note": "两段式校验码写入 + 删除即空洞 + 两阶段原地压缩；自描述头可重建索引"
+      }
+    ]
+  },
+  "components": [
+    { "id": "caller", "type": "external", "label": "上层调用方", "sublabel": "业务 / 压测线程 · future.get()", "pos": [40, 250], "size": [150, 64] },
+    { "id": "controller", "type": "backend", "label": "Controller", "sublabel": "组装依赖 · 异步接口透传", "pos": [240, 250], "size": [150, 64] },
+    { "id": "cache", "type": "backend", "label": "Cache 内存热层", "sublabel": "cache_db: name → Val", "tag": "WritePrefMutex", "pos": [450, 250], "size": [160, 64] },
+    { "id": "diskthread", "type": "backend", "label": "DiskThread 磁盘单线程", "sublabel": "CACHE_TASK / DISK_TASK 双队列", "pos": [670, 250], "size": [170, 64] },
+    { "id": "disk", "type": "backend", "label": "Disk 持久化层", "sublabel": "inDisk 偏移索引 + holes 空洞索引", "pos": [900, 250], "size": [170, 64] },
+    { "id": "file", "type": "database", "label": "数据文件（单文件日志）", "sublabel": "86B 自描述记录 · 两段式校验码", "tag": "删除 = 空洞 · best-fit 复用", "pos": [1130, 250], "size": [190, 64] },
+    { "id": "readpool", "type": "backend", "label": "ReadPool 读线程池", "sublabel": "N 线程 · 共享锁命中读", "pos": [455, 470], "size": [150, 60] },
+    { "id": "writethread", "type": "backend", "label": "WriteThread 写线程", "sublabel": "缓存写串行 + 全局采样淘汰", "pos": [645, 470], "size": [160, 60] },
+    { "id": "typereg", "type": "backend", "label": "类型注册表（data_type.h）", "sublabel": "自定义类型 · cereal 编解码", "pos": [895, 470], "size": [180, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "存储层（读并发 + 写串行 + 磁盘单线程）", "wraps": ["controller", "cache", "diskthread", "disk", "readpool", "writethread", "typereg"] },
+    { "kind": "region", "label": "磁盘无锁区：索引 / 空洞 / 文件句柄仅 DiskThread 访问", "wraps": ["diskthread", "disk", "file"] }
+  ],
+  "connections": [
+    { "id": "call-controller", "from": "caller", "to": "controller", "label": "add / mod / del / sel", "variant": "emphasis", "fromSide": "right", "toSide": "left", "route": "straight", "labelDy": 62 },
+    { "id": "controller-cache", "from": "controller", "to": "cache", "label": "缓存侧接口", "fromSide": "right", "toSide": "left", "route": "straight", "labelDy": 62 },
+    { "id": "cache-diskthread", "from": "cache", "to": "diskthread", "label": "提交磁盘任务", "fromSide": "right", "toSide": "left", "route": "straight", "labelDx": 72, "labelDy": 62 },
+    { "id": "diskthread-disk", "from": "diskthread", "to": "disk", "label": "索引 + 文件 IO", "fromSide": "right", "toSide": "left", "route": "straight", "labelDy": 62 },
+    { "id": "disk-file", "from": "disk", "to": "file", "label": "两段式写 / 空洞复用 / 压缩", "fromSide": "right", "toSide": "left", "route": "straight", "labelDy": 62 },
+    { "id": "cache-readpool", "from": "cache", "to": "readpool", "label": "命中读任务 / 返回实体", "fromSide": "bottom", "toSide": "top", "route": "straight", "labelDy": 26 },
+    { "id": "cache-writethread", "from": "cache", "to": "writethread", "label": "写任务 / 淘汰（串行）", "labelDy": 64 },
+    { "id": "typereg-disk", "from": "typereg", "to": "disk", "label": "cereal 编解码", "fromSide": "top", "toSide": "bottom", "route": "straight" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "并发与异步", "items": ["读线程池并发命中读；单写线程串行缓存写 + 采样淘汰", "磁盘单线程独占 inDisk / holes / 文件句柄 → 天然无锁区", "AsyncResult 续延链：服务线程只投递不等待，慢 IO 不阻塞读写路径"] },
+    { "dot": "emerald", "title": "磁盘格式与一致性", "items": ["86B 自描述记录头：VALID / DELETED（删除 = 空洞）/ BROKEN（残尾）", "两段式校验码：崩溃只丢正在写的半条；写失败回滚截断", "best-fit 空洞复用 + 两阶段原地压缩，降低写放大与压缩频率"] },
+    { "dot": "violet", "title": "验证与结果", "items": ["探针对序列化 / 文件写 / flush / 磁盘读分相归因", "1:3:5 压测：命中读 ~85 万 QPS；满盘混合命中率 96%+", "miss 读 100% 成功；压缩 16 次 / 1.45s（文件 7,991MB → 2,172MB）"] }
+  ]
+}
