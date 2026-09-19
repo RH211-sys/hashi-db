@@ -455,9 +455,9 @@ int main() {
 	auto begin = std::chrono::steady_clock::now();
 
 	// 1. 裸接口 QPS：全读 / 读7写3 / 全写（各自重建 db，互不污染）
-	qpsScene("[1] QPS - read-only", 1.0);
+	// qpsScene("[1] QPS - read-only", 1.0);
 	qpsScene("[2] QPS - read70/write30", 0.7);		
-	qpsScene("[3] QPS - write-only", 0.0);
+	// qpsScene("[3] QPS - write-only", 0.0);
 
 	// 2. 缓存命中率对照：总数据 = 缓存 2x / 3x（200M / 300M，比例 1:2:5 / 1:3:5，磁盘 500M 内）
 	// hitRateScene(2);
