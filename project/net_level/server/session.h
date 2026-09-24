@@ -29,6 +29,7 @@ private:
     bool authenticated = false;                  // 认证状态：是否已完成 AUTH
     std::string principal;                       // 认证主体：用户名或本地管理身份
     std::uint64_t featureBits = 0;               // 特性位：HELLO 协商后的能力集合
+    bool negotiated = false;                     // 协商状态：是否已成功完成 HELLO
 
 public:
     /*
@@ -63,6 +64,30 @@ public:
         返回：是否已认证
     */
     bool isAuthenticated() const;
+
+    /*
+        函数：isNegotiated
+        参数：无
+        功能：读取协议握手状态
+        返回：是否已完成 HELLO
+    */
+    bool isNegotiated() const;
+
+    /*
+        函数：getPrincipal
+        参数：无
+        功能：读取认证主体
+        返回：主体名称
+    */
+    const std::string& getPrincipal() const;
+
+    /*
+        函数：getFeatureBits
+        参数：无
+        功能：读取协商成功的特性位
+        返回：特性位掩码
+    */
+    std::uint64_t getFeatureBits() const;
 };
 
 }

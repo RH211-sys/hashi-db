@@ -72,6 +72,7 @@ enum class ErrorCode : std::uint16_t {
     NOAUTH = 102,                                // 未认证：当前会话尚未通过认证
     UNKNOWN_COMMAND = 400,                       // 未知命令：opcode 不在协议定义中
     FORBIDDEN = 401,                             // 无权限：会话不允许执行当前命令
+    TYPE_NOT_REGISTERED = 402,                   // 类型未注册：wire type 没有显式 codec
     BUSY = 300,                                  // 忙：服务容量或在途请求达到上限
     TOO_LARGE = 301,                             // 过大：帧、字段或输出超过限制
     INTERNAL = 500,                              // 内部错误：网络层未分类的服务错误

@@ -12,7 +12,7 @@
 #include "../protocol/protocol.h"
 #include "../reactor/reactor_group.h"
 #include "acceptor.h"
-#include "connection_registry.h"
+#include <atomic>
 #include <cstddef>
 #include <memory>
 
@@ -28,7 +28,9 @@ struct ServerConfig {
     std::size_t maxClients = 10000;              // 连接上限：限制同时存在的客户端数量
     std::size_t maxPipelineRequests = 64;        // Pipeline 上限：限制单连接待执行请求数
     std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES; // 帧上限：限制单个协议帧大小
-    bool tlsRequired = true;                     // TLS 策略：默认要求加密传输
+    bool tlsRequired = true;                     // TLS 策略：默认要求加密传输；当前尚无 TLS transport
+    bool allowPlaintextForDevelopment = false;    // 明文开发许可：需显式设置
+    bool allowInsecureRemote = false;             // 远程明文许可：仅用于隔离测试，默认禁止
 };
 
 /*
@@ -46,8 +48,9 @@ private:
     std::shared_ptr<ICommandExecutor> executor;  // 命令执行器：所有结构化请求的业务入口
     std::unique_ptr<ReactorGroup> reactorGroup;  // Reactor 组：管理事件循环线程
     std::unique_ptr<Acceptor> acceptor;          // 接收器：监听并接受新客户端连接
-    std::shared_ptr<ConnectionRegistry> connectionRegistry; // 注册表：提供连接查询和关闭管理
     ServerState state = ServerState::CREATED;    // 服务状态：控制启动、运行、排空和停止流程
+    std::atomic<std::size_t> activeClients{0};     // 当前接受并未关闭的连接数
+    std::atomic<ConnectionId> nextConnectionId{1}; // 进程内单调递增连接标识
 
     friend class Controller;                     // Controller：网络服务的对外统一入口
 
@@ -59,6 +62,10 @@ public:
         返回：无
     */
     NetworkServer(ServerConfig config, std::shared_ptr<ICommandExecutor> executor);
+    ~NetworkServer();
+
+    NetworkServer(const NetworkServer&) = delete;
+    NetworkServer& operator=(const NetworkServer&) = delete;
 
     /*
         函数：start

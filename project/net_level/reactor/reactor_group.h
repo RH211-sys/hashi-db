@@ -9,8 +9,11 @@
 
 #include "reactor.h"
 #include "../server/connection.h"
+#include "../server/acceptor.h"
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace mydb::net {
@@ -27,6 +30,8 @@ class ReactorGroup {
 private:
     std::vector<std::unique_ptr<Reactor>> reactors; // Reactor 列表：服务端所有事件循环
     std::size_t nextReactor = 0;                   // 分派游标：轮询选择下一个 Reactor
+    mutable std::mutex mutex;                      // 保护启动、停止和新连接分派状态
+    bool running = false;                          // 运行状态：仅在全部 Reactor 启动后接受连接
 
     friend class NetworkServer;                    // NetworkServer：控制 ReactorGroup 生命周期
 
@@ -61,7 +66,8 @@ public:
         功能：将新连接绑定到一个 Reactor
         返回：是否成功分派
     */
-    bool dispatch(std::unique_ptr<Transport> transport, Endpoint peer, std::size_t maxPipelineRequests);
+    bool dispatch(std::unique_ptr<Transport> transport, Endpoint peer, std::size_t maxPipelineRequests,
+                  ConnectionId connectionId, ClientSlotRelease releaseSlot, std::uint32_t maxFrameBytes);
 };
 
 }

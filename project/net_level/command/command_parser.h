@@ -29,7 +29,8 @@ public:
         返回：成功返回 CommandRequest；失败返回对应 ErrorCode 和错误信息
     */
     bool parse(const Frame& frame, ConnectionId connectionId, CommandRequest& request,
-               ErrorCode& error, std::string& message) const;
+               ErrorCode& error, std::string& message,
+               std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES) const;
 };
 
 }

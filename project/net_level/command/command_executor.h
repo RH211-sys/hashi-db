@@ -9,6 +9,7 @@
 
 #include "../protocol/protocol.h"
 #include <functional>
+#include <memory>
 
 class Controller;                                // 存储 Controller：阶段测试适配器依赖的现有存储层入口
 
@@ -54,9 +55,13 @@ public:
 */
 class StorageControllerExecutor final : public ICommandExecutor {
 private:
-    ::Controller& storageController;             // 存储 Controller：阶段测试期间承接网络命令
+    class WorkerPool;                            // 独立有界线程池：只在 worker 等待存储 future
+
+    ::Controller& storageController;             // 存储 Controller：必须长于此执行器及其全部在途任务
+    std::unique_ptr<WorkerPool> workerPool;      // 等待 future 的 worker：析构时排空并 join
 
 public:
+    ~StorageControllerExecutor() override;
     /*
         函数：StorageControllerExecutor
         参数：storageController：现有存储层 Controller

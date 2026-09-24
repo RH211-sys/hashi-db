@@ -9,6 +9,7 @@
 
 #include "../common/net_types.h"
 #include <cstddef>
+#include <cstdint>
 
 namespace mydb::net {
 
@@ -49,6 +50,14 @@ public:
         返回：无
     */
     virtual ~Transport() = default;
+
+    /*
+        函数：nativeHandle
+        参数：无
+        功能：返回底层原生句柄的整数表示，不暴露平台 socket 类型
+        返回：句柄；不可用时返回 -1
+    */
+    virtual std::intptr_t nativeHandle() const noexcept = 0;
 
     /*
         函数：handshake

@@ -20,7 +20,8 @@ enum PollEvent : std::uint32_t {
     POLL_READ = 1U << 0,                          // 可读：socket 有输入数据或握手读事件
     POLL_WRITE = 1U << 1,                         // 可写：socket 可以继续发送数据
     POLL_ERROR = 1U << 2,                         // 错误：底层 socket 发生错误
-    POLL_HANGUP = 1U << 3                         // 挂断：对端关闭或连接半关闭
+    POLL_HANGUP = 1U << 3,                        // 挂断：对端关闭或连接半关闭
+    POLL_WAKE = 1U << 4                           // 唤醒：保留连接 ID 0 代表跨线程唤醒
 };
 
 /*
@@ -56,7 +57,7 @@ public:
         功能：将连接加入事件轮询器
         返回：是否加入成功
     */
-    virtual bool add(ConnectionId connectionId, std::uint32_t events) = 0;
+    virtual bool add(ConnectionId connectionId, std::intptr_t nativeHandle, std::uint32_t events) = 0;
 
     /*
         函数：modify
@@ -81,6 +82,14 @@ public:
         返回：事件数量；失败返回负数
     */
     virtual int wait(PollEventItem* events, int maxEvents, int timeoutMs) = 0;
+
+    /*
+        函数：wakeup
+        参数：无
+        功能：唤醒阻塞中的 wait，使其返回 POLL_WAKE 事件
+        返回：是否成功触发唤醒
+    */
+    virtual bool wakeup() = 0;
 };
 
 }

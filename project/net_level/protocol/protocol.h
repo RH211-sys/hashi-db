@@ -34,7 +34,9 @@ enum class Opcode : std::uint16_t {
     PERSIST = 0x0020,                            // 持久化：将指定数据或全部脏数据刷盘
     FLUSH = 0x0021,                              // 刷盘：执行过期清理和持久化
     REWRITE = 0x0022,                            // 重写：整理磁盘文件和空洞
-    STATS = 0x0030                               // 统计：读取服务或存储统计
+    STATS = 0x0030,                              // 统计：读取服务或存储统计
+    CLIENT_LIST = 0x0031,                        // 客户端列表：读取连接快照
+    CLIENT_KILL = 0x0032                        // 客户端踢出：按 ConnectionId 关闭连接
 };
 
 /*

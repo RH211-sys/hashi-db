@@ -8,11 +8,17 @@
 */
 
 #include "../common/net_types.h"
+#include "../transport/transport.h"
+#include <atomic>
 #include <functional>
+#include <memory>
+#include <thread>
 
 namespace mydb::net {
 
-using AcceptedConnection = std::function<void(int nativeHandle, const Endpoint& peer)>; // 新连接回调：交给服务端创建 Transport
+using ClientSlotRelease = std::function<void()>; // 槽位释放回调：连接关闭时调用一次
+using AcceptedConnection = std::function<void(std::unique_ptr<Transport> transport, const Endpoint& peer,
+                                               ClientSlotRelease releaseSlot)>; // 接受回调：接管 transport 和连接槽
 
 /*
     类名：Acceptor
@@ -27,6 +33,11 @@ private:
     Endpoint endpoint;                            // 监听端点：服务端绑定的地址和端口
     std::uint32_t backlog;                        // 监听队列：内核等待接受的连接数量
     AcceptedConnection onAccepted;                // 接收回调：把新连接交给 ReactorGroup
+    std::size_t maxClients = 10000;                // 连接硬上限
+    std::atomic<std::size_t>* activeClients = nullptr; // 服务端连接计数，由接收器线程安全更新
+    std::intptr_t listenHandle = -1;              // 监听 socket：平台句柄以整数形式保存
+    std::atomic<bool> running{false};              // 接收状态：控制 accept 线程退出
+    std::thread worker;                            // 接收线程：非阻塞 accept 循环
 
     friend class NetworkServer;                   // NetworkServer：控制监听器启停
 

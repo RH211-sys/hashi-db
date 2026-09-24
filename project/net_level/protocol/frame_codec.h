@@ -50,10 +50,18 @@ public:
     /*
         函数：feed
         参数：data：新收到的字节；frame：解析成功后写入的完整帧
-        功能：向增量解析器追加字节，并尽可能解析一个完整帧
-        返回：DecodeStatus，表示需要更多数据、解析成功或协议错误
+        功能：兼容接口，解析一个完整帧并缓存未消费尾部；为严格限制粘包内存，单次聚合输入最多缓存两个 maxFrameBytes
+        返回：DecodeStatus，表示需要更多数据、解析成功或协议错误；大量粘包请使用带 offset 的重载
     */
     DecodeStatus feed(const ByteBuffer& data, Frame& frame);
+
+    /*
+        函数：feed
+        参数：data：本次读取的完整字节块；offset：已消费位置，由调用方在新字节块开始时置 0；frame：解析成功后写入的帧
+        功能：从 data 的 offset 处消费至多一个完整帧；调用方在 offset 小于 data.size() 时继续调用以处理粘连帧
+        返回：DecodeStatus；FRAME_READY 时 offset 指向该帧末尾，NEED_MORE 时该字节块已消费完并暂存部分帧
+    */
+    DecodeStatus feed(const ByteBuffer& data, std::size_t& offset, Frame& frame);
 
     /*
         函数：encode
