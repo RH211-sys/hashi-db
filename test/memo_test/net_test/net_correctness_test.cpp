@@ -332,6 +332,158 @@ void testConnectionOrdering() {
 }
 
 /*
+    功能：验证 HELLO 失败后按序拒绝已排队的 AUTH 和 GET 请求
+    传参：无
+    返回值：无
+*/
+void testConnectionRejectsQueuedRequestsAfterHelloFailure() {
+    ByteBuffer input = encodeFrame(makeHelloFrame(400), "encode failed pipelined HELLO");
+    const ByteBuffer authBytes = encodeFrame(makeAuthFrame(401), "encode queued AUTH after failed HELLO");
+    const ByteBuffer getBytes = encodeFrame(
+        makeFrame(Opcode::GET, 402, {makeTextBytesField(FieldId::KEY, FieldType::BYTES, "key")}),
+        "encode queued GET after failed HELLO");
+    input.insert(input.end(), authBytes.begin(), authBytes.end());
+    input.insert(input.end(), getBytes.begin(), getBytes.end());
+
+    auto transport = std::make_unique<MemoryTransport>(std::move(input), 5, 3);
+    MemoryTransport* transportView = transport.get();
+    RecordingExecutor executor;
+    std::vector<CommandResponse> posted;
+    Connection connection(53, 1, std::move(transport), 4, Endpoint{"127.0.0.1", 1234},
+                         DEFAULT_MAX_FRAME_BYTES, 7, {},
+                         [&posted](CommandResponse response) { posted.push_back(std::move(response)); });
+
+    connection.onReadable(executor, 4096);
+    require(executor.requests.size() == 1 && executor.requests.front().opcode == Opcode::HELLO,
+            "HELLO failure remains the only business request dispatched");
+    completeRequest(connection, executor, 0, posted, ErrorCode::UNSUPPORTED);
+    require(connection.getState() == ConnectionState::WAIT_HELLO,
+            "failed HELLO does not advance the connection protocol state");
+    require(executor.requests.size() == 1, "queued AUTH and GET are rejected before business dispatch");
+
+    for (std::size_t attempt = 0; attempt < 512; ++attempt) {
+        connection.onWritable(1);
+    }
+    const std::vector<Frame> responses = decodeFrames(transportView->writtenBytes(),
+                                                       "decode responses after failed HELLO");
+    require(responses.size() == 3, "failed HELLO and queued requests each receive a response");
+    for (std::size_t index = 0; index < responses.size(); ++index) {
+        require(responses[index].header.requestId == 400 + index,
+                "failed HELLO responses preserve request order");
+        require((responses[index].header.flags & RESPONSE) != 0 &&
+                    (responses[index].header.flags & ERROR) != 0,
+                "failed HELLO and later pre-negotiation requests return errors");
+    }
+
+    connection.close();
+}
+
+/*
+    功能：验证排队请求完成前协议解析错误不会越序响应
+    传参：无
+    返回值：无
+*/
+void testConnectionDefersProtocolErrorAfterQueuedRequest() {
+    ByteBuffer input = encodeFrame(makeHelloFrame(410), "encode HELLO before deferred protocol error");
+    const ByteBuffer authBytes = encodeFrame(makeAuthFrame(411), "encode AUTH before deferred protocol error");
+    const ByteBuffer invalidGetBytes = encodeFrame(makeFrame(Opcode::GET, 412),
+                                                   "encode invalid GET after queued AUTH");
+    input.insert(input.end(), authBytes.begin(), authBytes.end());
+    input.insert(input.end(), invalidGetBytes.begin(), invalidGetBytes.end());
+
+    auto transport = std::make_unique<MemoryTransport>(std::move(input));
+    MemoryTransport* transportView = transport.get();
+    RecordingExecutor executor;
+    std::vector<CommandResponse> posted;
+    Connection connection(54, 1, std::move(transport), 4, Endpoint{"127.0.0.1", 1234},
+                         DEFAULT_MAX_FRAME_BYTES, 7, {},
+                         [&posted](CommandResponse response) { posted.push_back(std::move(response)); });
+
+    connection.onReadable(executor, 4096);
+    connection.onReadable(executor, 4096);
+    connection.onReadable(executor, 4096);
+    require(executor.requests.size() == 1 && executor.requests.front().opcode == Opcode::HELLO,
+            "queued AUTH and later invalid GET wait behind in-flight HELLO");
+
+    completeRequest(connection, executor, 0, posted);
+    require(executor.requests.size() == 2 && executor.requests[1].opcode == Opcode::AUTH,
+            "queued AUTH is dispatched before the later protocol error");
+    completeRequest(connection, executor, 1, posted);
+    require(executor.requests.size() == 2, "invalid GET never reaches the business executor");
+
+    for (std::size_t attempt = 0; attempt < 512; ++attempt) {
+        connection.onWritable(1);
+    }
+    const std::vector<Frame> responses = decodeFrames(transportView->writtenBytes(),
+                                                       "decode responses around deferred protocol error");
+    require(responses.size() == 3, "HELLO, AUTH, and deferred protocol error each produce a response");
+    require(responses[0].header.requestId == 410 &&
+                (responses[0].header.flags & RESPONSE) != 0 &&
+                (responses[0].header.flags & ERROR) == 0,
+            "HELLO response precedes queued AUTH");
+    require(responses[1].header.requestId == 411 &&
+                (responses[1].header.flags & RESPONSE) != 0 &&
+                (responses[1].header.flags & ERROR) == 0,
+            "queued AUTH response precedes protocol error");
+    require(responses[2].header.requestId == 412 &&
+                (responses[2].header.flags & RESPONSE) != 0 &&
+                (responses[2].header.flags & ERROR) != 0,
+            "protocol error response retains the invalid request identifier");
+    require(connection.getState() == ConnectionState::CLOSED && transportView->isClosed(),
+            "protocol error closes the connection after queued responses drain");
+}
+
+/*
+    功能：验证对端半关闭后已接收请求及其响应仍按序排空
+    传参：无
+    返回值：无
+*/
+void testConnectionDrainsRequestsAfterPeerHalfClose() {
+    ByteBuffer input = encodeFrame(makeHelloFrame(420), "encode half-closed pipelined HELLO");
+    const ByteBuffer authBytes = encodeFrame(makeAuthFrame(421), "encode half-closed pipelined AUTH");
+    const ByteBuffer getBytes = encodeFrame(
+        makeFrame(Opcode::GET, 422, {makeTextBytesField(FieldId::KEY, FieldType::BYTES, "key")}),
+        "encode half-closed pipelined GET");
+    input.insert(input.end(), authBytes.begin(), authBytes.end());
+    input.insert(input.end(), getBytes.begin(), getBytes.end());
+
+    auto transport = std::make_unique<MemoryTransport>(std::move(input), 5, 3, true);
+    MemoryTransport* transportView = transport.get();
+    RecordingExecutor executor;
+    std::vector<CommandResponse> posted;
+    Connection connection(55, 1, std::move(transport), 4, Endpoint{"127.0.0.1", 1234},
+                         DEFAULT_MAX_FRAME_BYTES, 7, {},
+                         [&posted](CommandResponse response) { posted.push_back(std::move(response)); });
+
+    connection.onReadable(executor, 4096);
+    require(executor.requests.size() == 1 && executor.requests.front().opcode == Opcode::HELLO,
+            "half-close preserves the in-flight HELLO");
+    completeRequest(connection, executor, 0, posted);
+    require(executor.requests.size() == 2 && executor.requests[1].opcode == Opcode::AUTH,
+            "half-close drains queued AUTH after HELLO");
+    completeRequest(connection, executor, 1, posted);
+    require(executor.requests.size() == 3 && executor.requests[2].opcode == Opcode::GET,
+            "half-close drains queued GET after AUTH");
+    completeRequest(connection, executor, 2, posted);
+
+    for (std::size_t attempt = 0; attempt < 512; ++attempt) {
+        connection.onWritable(1);
+    }
+    const std::vector<Frame> responses = decodeFrames(transportView->writtenBytes(),
+                                                       "decode responses after peer half-close");
+    require(responses.size() == 3, "half-closed connection writes every queued response");
+    for (std::size_t index = 0; index < responses.size(); ++index) {
+        require(responses[index].header.requestId == 420 + index,
+                "half-close responses preserve request order");
+        require((responses[index].header.flags & RESPONSE) != 0 &&
+                    (responses[index].header.flags & ERROR) == 0,
+                "half-close requests complete successfully");
+    }
+    require(connection.getState() == ConnectionState::CLOSED && transportView->isClosed(),
+            "half-closed connection closes after writing queued responses");
+}
+
+/*
     功能：验证损坏帧关闭连接且不会派发业务请求
     传参：无
     返回值：无
@@ -536,6 +688,9 @@ int main() {
     testCommandParser();
     testSession();
     testConnectionOrdering();
+    testConnectionRejectsQueuedRequestsAfterHelloFailure();
+    testConnectionDefersProtocolErrorAfterQueuedRequest();
+    testConnectionDrainsRequestsAfterPeerHalfClose();
     testConnectionRejectsInvalidFrame();
 #if defined(__linux__) && !defined(_WIN32)
     testLinuxServerIntegration();

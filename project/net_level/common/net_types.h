@@ -52,6 +52,16 @@ enum class ConnectionState : std::uint8_t {
 };
 
 /*
+    类型名：ConnectionActivityState
+    功能：描述连接请求处理状态，与协议协商及传输状态分离。
+*/
+enum class ConnectionActivityState : std::uint8_t {
+    IDLE,                                        // 空闲：可以按序派发队首请求
+    PROCESSING,                                  // 正在处理：保留后续请求并等待当前请求完成
+    DISCONNECTED                                 // 断开：停止处理并清理连接消息
+};
+
+/*
     类型名：RequestSource
     功能：标识请求来自远程客户端还是本地管理入口。
 */

@@ -100,6 +100,7 @@ Connection::Connection(ConnectionId id, ReactorId ownerReactor, std::unique_ptr<
     if (maxPipelineRequests == 0 || maxFrameBytes < BASE_HEADER_LENGTH) {
         this->transport->close();
         state = ConnectionState::CLOSED;
+        activityState = ConnectionActivityState::DISCONNECTED;
         if (this->releaseSlot) {
             auto release = std::move(this->releaseSlot);
             release();
@@ -113,6 +114,7 @@ Connection::Connection(ConnectionId id, ReactorId ownerReactor, std::unique_ptr<
         state = ConnectionState::TLS_HANDSHAKE;
     } else {
         state = ConnectionState::CLOSED;
+        activityState = ConnectionActivityState::DISCONNECTED;
         this->transport->close();
         if (this->releaseSlot) {
             auto release = std::move(this->releaseSlot);
@@ -209,7 +211,8 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
             std::size_t bytesRead = 0;
             const TransportResult result = retryPendingRead(bytesRead);
             readBudget -= std::min(readBudget, bytesRead);
-            if (bytesRead != 0 && state != ConnectionState::CLOSING && !processInput(executor)) {
+            if (bytesRead != 0 && (state != ConnectionState::CLOSING || peerClosed) &&
+                !processInput(executor)) {
                 return;
             }
             if (state == ConnectionState::CLOSED) {
@@ -227,8 +230,10 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
                 return;
             }
             if (state == ConnectionState::CLOSING) {
-                pendingInput.clear();
-                pendingInputOffset = 0;
+                if (activityState == ConnectionActivityState::DISCONNECTED) {
+                    pendingInput.clear();
+                    pendingInputOffset = 0;
+                }
                 return;
             }
         }
@@ -241,7 +246,7 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
     }
     if (state == ConnectionState::CLOSED || state == ConnectionState::CLOSING ||
         readPaused || peerClosed || readBudget == 0) {
-        if (peerClosed && !activeRequestId && outputQueue.empty()) {
+        if (peerClosed && activityState == ConnectionActivityState::DISCONNECTED && outputQueue.empty()) {
             close();
         }
         return;
@@ -294,24 +299,21 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
 /*
     函数：onPeerHalfClose
     参数：无
-    功能：记录对端半关闭、丢弃尚未派发的请求并保留当前请求的响应路径
+    功能：记录对端半关闭并继续排空已接收的请求和响应
     返回：无
 */
 void Connection::onPeerHalfClose() {
-    if (peerClosed || state == ConnectionState::CLOSED) {
+    if (peerClosed || state == ConnectionState::CLOSED ||
+        activityState == ConnectionActivityState::DISCONNECTED) {
         return;
     }
     peerClosed = true;
     readPaused = true;
     closeAfterOutput = true;
-    pendingInput.clear();
-    pendingInputOffset = 0;
-    pipeline.clear();
-    if (activeRequestId || !outputQueue.empty()) {
-        state = ConnectionState::CLOSING;
-        return;
+    state = ConnectionState::CLOSING;
+    if (executorForResume != nullptr) {
+        processInput(*executorForResume);
     }
-    close();
 }
 
 /*
@@ -323,8 +325,12 @@ void Connection::onPeerHalfClose() {
 bool Connection::processInput(ICommandExecutor& executor) {
     executorForResume = &executor;
     while (pendingInputOffset < pendingInput.size() &&
-           pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) < maxPipelineRequests &&
-           state != ConnectionState::CLOSED && state != ConnectionState::CLOSING) {
+           pipeline.size() + (activityState == ConnectionActivityState::PROCESSING ? 1U : 0U) <
+               maxPipelineRequests &&
+           !pendingProtocolError.has_value() &&
+           activityState != ConnectionActivityState::DISCONNECTED &&
+           state != ConnectionState::CLOSED &&
+           (state != ConnectionState::CLOSING || peerClosed)) {
         Frame frame;
         const DecodeStatus status = codec.feed(pendingInput, pendingInputOffset, frame);
         if (status == DecodeStatus::NEED_MORE) {
@@ -342,7 +348,7 @@ bool Connection::processInput(ICommandExecutor& executor) {
             break;
         }
         // 同一连接最多一个在途请求，因此本次解析到此为止，剩余字节留给完成回投后继续处理。
-        if (activeRequestId.has_value()) {
+        if (activityState == ConnectionActivityState::PROCESSING) {
             break;
         }
     }
@@ -355,8 +361,22 @@ bool Connection::processInput(ICommandExecutor& executor) {
                            pendingInput.begin() + static_cast<std::ptrdiff_t>(pendingInputOffset));
         pendingInputOffset = 0;
     }
-    readPaused = pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) >= maxPipelineRequests;
+    readPaused = pendingProtocolError.has_value() ||
+        pipeline.size() + (activityState == ConnectionActivityState::PROCESSING ? 1U : 0U) >=
+            maxPipelineRequests;
     dispatchNext(executor);
+
+    if (peerClosed && activityState == ConnectionActivityState::IDLE && pipeline.empty() &&
+        !pendingProtocolError.has_value()) {
+        activityState = ConnectionActivityState::DISCONNECTED;
+        state = ConnectionState::CLOSING;
+        pendingInput.clear();
+        pendingInputOffset = 0;
+        if (outputQueue.empty()) {
+            close();
+        }
+    }
+
     return state != ConnectionState::CLOSED;
 }
 
@@ -373,22 +393,12 @@ bool Connection::handleFrame(Frame frame, ICommandExecutor& executor) {
     const RequestId requestId = frame.header.requestId;
     const Opcode opcode = frame.header.opcode;
     if (!parser.parse(std::move(frame), id, request, error, message, static_cast<std::uint32_t>(maxFrameBytes))) {
-        queueProtocolError(requestId, opcode, error, std::move(message));
+        pendingProtocolError = PendingProtocolError{requestId, opcode, error, std::move(message)};
+        readPaused = true;
         return false;
     }
-    request.principal = session.getPrincipal();
     request.peer = peer;
 
-    if (request.opcode == Opcode::HELLO && session.isNegotiated()) {
-        queueProtocolError(request.requestId, request.opcode, ErrorCode::BAD_FRAME,
-                           "HELLO already completed");
-        return false;
-    }
-    if (request.opcode == Opcode::AUTH && !session.isNegotiated()) {
-        queueProtocolError(request.requestId, request.opcode, ErrorCode::BAD_FRAME,
-                           "HELLO required before AUTH");
-        return false;
-    }
     pipeline.push_back(std::move(request));
     dispatchNext(executor);
     return true;
@@ -399,7 +409,7 @@ bool Connection::handleFrame(Frame frame, ICommandExecutor& executor) {
     参数：requestId：出错请求标识；opcode：出错命令码；error：状态码；message：错误说明
     功能：写出一条协议错误响应并进入关闭流程
     返回：无
-    备注：协议错误后不再接受新请求，只把当前错误响应写完
+    备注：协议错误后停止处理新请求，按序写完已生成的响应后关闭
 */
 void Connection::queueProtocolError(RequestId requestId, Opcode opcode, ErrorCode error, std::string message) {
     Frame frame;
@@ -423,6 +433,8 @@ void Connection::queueProtocolError(RequestId requestId, Opcode opcode, ErrorCod
     queuedOutputBytes += encoded.size();
     outputQueue.push_back(std::move(encoded));
     outputOffsets.push_back(0);
+    pendingProtocolError.reset();
+    activityState = ConnectionActivityState::DISCONNECTED;
     activeRequestId.reset();
     closeAfterOutput = true;
     readPaused = true;
@@ -459,7 +471,8 @@ void Connection::onWritable(std::size_t writeBudget) {
         if (pendingTransportOperation == PendingTransportOperation::READ) {
             std::size_t bytesRead = 0;
             const TransportResult result = retryPendingRead(bytesRead);
-            if (bytesRead != 0 && state != ConnectionState::CLOSING && !processInput(*executorForResume)) {
+            if (bytesRead != 0 && (state != ConnectionState::CLOSING || peerClosed) &&
+                !processInput(*executorForResume)) {
                 return;
             }
             if (state == ConnectionState::CLOSED) {
@@ -474,8 +487,10 @@ void Connection::onWritable(std::size_t writeBudget) {
                 return;
             }
             if (state == ConnectionState::CLOSING) {
-                pendingInput.clear();
-                pendingInputOffset = 0;
+                if (activityState == ConnectionActivityState::DISCONNECTED) {
+                    pendingInput.clear();
+                    pendingInputOffset = 0;
+                }
             }
         } else {
             std::size_t bytesWritten = 0;
@@ -525,16 +540,18 @@ void Connection::onWritable(std::size_t writeBudget) {
         }
     }
 
-    if (closeAfterOutput && outputQueue.empty() && !activeRequestId) {
-        close();
-        return;
-    }
-    if (!closeAfterOutput && !activeRequestId) {
-        // 输出腾出空间后恢复解析输入，并调度下一个待执行请求。
-        readPaused = false;
+    if (activityState == ConnectionActivityState::IDLE && (!closeAfterOutput || peerClosed)) {
+        if (!peerClosed) {
+            readPaused = false;
+        }
         if (!processInput(*executorForResume)) {
             return;
         }
+    }
+    if (closeAfterOutput && outputQueue.empty() &&
+        activityState == ConnectionActivityState::DISCONNECTED) {
+        close();
+        return;
     }
 }
 
@@ -546,7 +563,8 @@ void Connection::onWritable(std::size_t writeBudget) {
     备注：响应必须对应在途请求；无法对应时按协议错误处理并关闭连接
 */
 void Connection::complete(CommandResponse response) {
-    if (state == ConnectionState::CLOSED || !activeRequestId) {
+    if (state == ConnectionState::CLOSED ||
+        activityState == ConnectionActivityState::DISCONNECTED || !activeRequestId) {
         return;
     }
     if (response.connectionId != id || response.requestId != *activeRequestId) {
@@ -561,9 +579,6 @@ void Connection::complete(CommandResponse response) {
 
     if (peerClosed) {
         closeAfterOutput = true;
-        pipeline.clear();
-        pendingInput.clear();
-        pendingInputOffset = 0;
     }
 
     if (state == ConnectionState::CLOSING && !peerClosed) {
@@ -619,13 +634,16 @@ void Connection::complete(CommandResponse response) {
     queuedOutputBytes += encoded.size();
     outputQueue.push_back(std::move(encoded));
     outputOffsets.push_back(0);
+    const bool closeConnection = response.closeAfterWrite || completedOpcode == Opcode::QUIT;
     closeAfterOutput = closeAfterOutput || response.closeAfterWrite ||
                        completedOpcode == Opcode::QUIT || peerClosed;
     activeRequestId.reset();
+    activityState = ConnectionActivityState::IDLE;
 
-    if (closeAfterOutput) {
-        // 写完剩余响应即关闭；服务器关闭指令、QUIT 和对端 FIN 均不继续调度请求。
+    if (closeConnection) {
+        activityState = ConnectionActivityState::DISCONNECTED;
         state = ConnectionState::CLOSING;
+        // 终止类响应先结束连接处理，再清理尚未派发的请求。
         pipeline.clear();
         pendingInput.clear();
         pendingInputOffset = 0;
@@ -648,6 +666,7 @@ void Connection::close() {
     if (state == ConnectionState::CLOSED) {
         return;
     }
+    activityState = ConnectionActivityState::DISCONNECTED;
     state = ConnectionState::CLOSED;
     pipeline.clear();
     activeRequestId.reset();
@@ -659,6 +678,7 @@ void Connection::close() {
     outputQueue.clear();
     outputOffsets.clear();
     queuedOutputBytes = 0;
+    pendingProtocolError.reset();
     pendingTransportOperation = PendingTransportOperation::NONE;
     pendingTransportBytes = 0;
     if (transport) {
@@ -678,14 +698,32 @@ void Connection::close() {
 */
 void Connection::dispatchNext(ICommandExecutor& executor) {
     executorForResume = &executor;
-    if (state == ConnectionState::CLOSED || activeRequestId.has_value() || pipeline.empty() ||
-        state == ConnectionState::CLOSING) {
+    if (activityState != ConnectionActivityState::IDLE || state == ConnectionState::CLOSED ||
+        (state == ConnectionState::CLOSING && !peerClosed)) {
         return;
     }
+    if (pipeline.empty()) {
+        if (pendingProtocolError.has_value()) {
+            PendingProtocolError error = std::move(*pendingProtocolError);
+            pendingProtocolError.reset();
+            queueProtocolError(error.requestId, error.opcode, error.error, std::move(error.message));
+        }
+        return;
+    }
+
     CommandRequest request = std::move(pipeline.front());
     pipeline.pop_front();
+
+    if (request.opcode == Opcode::HELLO && session.isNegotiated()) {
+        queueProtocolError(request.requestId, request.opcode, ErrorCode::BAD_FRAME,
+                           "HELLO already completed");
+        return;
+    }
+
+    request.principal = session.getPrincipal();
     activeOpcode = request.opcode;
     activeRequestId = request.requestId;
+    activityState = ConnectionActivityState::PROCESSING;
 
     if (!session.canExecute(request.opcode, RequestSource::REMOTE)) {
         pendingFeatureBits.reset();
@@ -782,7 +820,9 @@ std::uint32_t Connection::interestEvents() const {
     }
     std::uint32_t events = 0;
     if (!readPaused && !peerClosed && state != ConnectionState::CLOSING &&
-        pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) < maxPipelineRequests) {
+        activityState != ConnectionActivityState::DISCONNECTED &&
+        pipeline.size() + (activityState == ConnectionActivityState::PROCESSING ? 1U : 0U) <
+            maxPipelineRequests) {
         events |= POLL_READ;
     }
     if (!outputQueue.empty() || (transport->events() & WANT_WRITE) != 0) {

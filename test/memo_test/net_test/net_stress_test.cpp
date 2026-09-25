@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -144,7 +145,8 @@ int main() {
         connection->complete(std::move(response));
     };
     connection = std::make_unique<Connection>(77, 1, std::move(transport), 64, Endpoint{"127.0.0.1", 6380},
-                                              DEFAULT_MAX_FRAME_BYTES, 1, {}, std::move(poster));
+                                              DEFAULT_MAX_FRAME_BYTES, 1, std::function<void()>{},
+                                              std::move(poster));
 
     connection->onReadable(executor, CONNECTION_READ_BUDGET);
     require(executor.submittedRequests() == 1, "stress begins with one in-flight request");

@@ -37,6 +37,13 @@ using ConnectionCompletionPoster = std::function<void(CommandResponse)>; // 完�
 */
 class Connection {
 private:
+    struct PendingProtocolError {
+        RequestId requestId;                       // 请求标识：对应无法解析或校验的帧
+        Opcode opcode;                              // 命令码：用于构造关联错误响应
+        ErrorCode error;                            // 错误类型：协议层稳定错误分类
+        std::string message;                        // 错误说明：有界输出给客户端
+    };
+
     enum class PendingTransportOperation : std::uint8_t {
         NONE,
         READ,
@@ -45,7 +52,8 @@ private:
 
     ConnectionId id;                                   // 连接标识：进程内唯一
     ReactorId ownerReactor;                            // 所属 Reactor：连接线程亲和性的依据
-    ConnectionState state;                             // 连接状态：控制读取、调度和关闭
+    ConnectionState state;                             // 生命周期状态：控制协议阶段、传输和关闭
+    ConnectionActivityState activityState = ConnectionActivityState::IDLE; // 请求状态：控制派发和等待队列
     std::uint64_t generation = 0;                      // 连接代际：区分复用连接标识的过期完成结果
     Endpoint peer;                                     // 对端地址：随请求交给业务层
     Session session;                                   // 会话状态：协议协商与认证结果
@@ -53,6 +61,7 @@ private:
     FrameCodec codec;                                  // 帧编解码器：拆包粘包与响应编码
     CommandParser parser;                              // 命令解析器：帧到结构化命令的校验
     std::deque<CommandRequest> pipeline;               // 待执行队列：已完整解析但尚未提交的请求
+    std::optional<PendingProtocolError> pendingProtocolError; // 延迟错误：排在已接收请求之后处理
     ByteBuffer pendingInput;                           // 输入缓冲：尚未组成完整帧的字节
     std::size_t pendingInputOffset = 0;                // 输入消费位置：当前字节块已解析到的下标
     std::deque<ByteBuffer> outputQueue;                // 输出队列：待发送的完整响应帧
@@ -72,7 +81,7 @@ private:
     bool closeAfterOutput = false;                     // 写完即关：输出清空后关闭连接
     bool pollerRegistered = false;                     // 轮询注册状态：当前是否加入 Reactor 事件轮询
     bool readPaused = false;                           // 读取暂停：队列或缓冲达到上限时停止关注可读
-    bool peerClosed = false;                           // 对端关闭发送方向：只完成当前请求并回应后关闭
+    bool peerClosed = false;                           // 对端关闭发送方向：排空已接收请求和响应后关闭
     PendingTransportOperation pendingTransportOperation = PendingTransportOperation::NONE; // 挂起操作：等待 OpenSSL 所需的交叉 I/O 就绪
     std::size_t pendingTransportBytes = 0;              // 挂起长度：重试时保持相同的缓冲区长度
 
