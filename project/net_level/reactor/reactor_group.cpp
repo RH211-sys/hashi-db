@@ -51,7 +51,7 @@ bool ReactorGroup::start() {
         }
     } catch (...) {
         for (std::size_t index = 0; index < started; ++index) {
-            reactors[index]->stop(false);
+            reactors[index]->stop();
         }
         return false;
     }
@@ -61,18 +61,18 @@ bool ReactorGroup::start() {
 
 /*
     函数：stop
-    参数：drain：是否优雅排空已提交请求
-    功能：停止所有 Reactor 并等待事件线程退出
+    参数：无
+    功能：立即停止所有 Reactor 并等待事件线程退出
     返回：无
 */
-void ReactorGroup::stop(bool drain) {
+void ReactorGroup::stop() {
     std::lock_guard<std::mutex> lock(mutex);
     if (!running) {
         return;
     }
     running = false;
     for (auto& reactor : reactors) {
-        reactor->stop(drain);
+        reactor->stop();
     }
 }
 

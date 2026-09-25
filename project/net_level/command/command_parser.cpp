@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 namespace mydb::net {
 namespace {
@@ -157,7 +158,7 @@ void setError(ErrorCode code, std::string_view text, ErrorCode& error, std::stri
 
 } // namespace
 
-bool CommandParser::parse(const Frame& frame, ConnectionId connectionId, CommandRequest& request,
+bool CommandParser::parse(Frame&& frame, ConnectionId connectionId, CommandRequest& request,
                           ErrorCode& error, std::string& message, std::uint32_t maxFrameBytes) const {
     request = CommandRequest{};
     error = ErrorCode::OK;
@@ -250,7 +251,7 @@ bool CommandParser::parse(const Frame& frame, ConnectionId connectionId, Command
     request.requestId = frame.header.requestId;
     request.source = RequestSource::REMOTE;
     request.opcode = frame.header.opcode;
-    request.fields = frame.fields;
+    request.fields = std::move(frame.fields);
     return true;
 }
 

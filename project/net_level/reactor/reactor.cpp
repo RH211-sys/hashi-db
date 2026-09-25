@@ -10,7 +10,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -43,7 +42,6 @@ constexpr std::size_t POLL_EVENT_BATCH = 128;      // 单次轮询最多处理�
 constexpr int POLL_WAIT_MS = 100;                  // 单次轮询等待毫秒数：也是停止检查的周期
 constexpr std::size_t READ_BUDGET_BYTES = 64U * 1024U;  // 单次可读事件最多读取字节数
 constexpr std::size_t WRITE_BUDGET_BYTES = 256U * 1024U; // 单次可写事件最多写出字节数
-constexpr int DRAIN_TIMEOUT_SECONDS = 30;          // 优雅停止的排空上限：超时后强制关闭
 
 /*
     类型名：SlotRelease
@@ -90,11 +88,8 @@ struct Reactor::Impl {
     std::thread worker;                                               // 事件线程：唯一执行 run() 的线程
     std::atomic<bool> running{false};                                 // 运行标记：false 时拒绝一切入队
     std::atomic<bool> stopping{false};                                // 停止标记：true 后不再接收新任务
-    std::atomic<bool> drain{false};                                   // 排空标记：true 表示优雅停止
-    bool drainStarted = false;                                        // 排空开始标记：仅事件线程访问
     bool acceptingPosts = false;                                      // 接收入队标记：仅锁内访问
     std::uint64_t nextGeneration = 1;                                 // 连接代际：区分复用连接 ID 的旧完成结果
-    std::chrono::steady_clock::time_point drainDeadline{};             // 排空截止时间：仅事件线程访问
 
     Impl(ReactorId reactorId, std::unique_ptr<Poller> reactorPoller,
          std::shared_ptr<ICommandExecutor> commandExecutor)
@@ -117,7 +112,7 @@ struct Reactor::Impl {
             }
             const bool stoppingNow = stopping.load(std::memory_order_acquire);
             if (kind == InboxKind::COMPLETION) {
-                if (stoppingNow && !drain.load(std::memory_order_acquire)) {
+                if (stoppingNow) {
                     return false;
                 }
                 if (completionInbox.size() < MAX_COMPLETION_TASKS) {
@@ -149,12 +144,12 @@ struct Reactor::Impl {
     }
 
     /*
-        函数：drainInbox
+        函数：processInbox
         参数：无
         功能：取出当前全部待执行任务并在本线程依次执行，单个任务异常不影响事件循环
         返回：无
     */
-    void drainInbox() {
+    void processInbox() {
         std::deque<ReactorTask> tasks;
         {
             std::lock_guard<std::mutex> lock(inboxMutex);
@@ -169,6 +164,9 @@ struct Reactor::Impl {
             }
         }
         for (auto& task : tasks) {
+            if (stopping.load(std::memory_order_acquire)) {
+                break;
+            }
             try {
                 task();
             } catch (...) {
@@ -239,9 +237,30 @@ struct Reactor::Impl {
             closeConnection(connectionId);
             return;
         }
-        if (!poller->modify(connectionId, found->second->interestEvents())) {
-            closeConnection(connectionId);
+        const std::uint32_t events = found->second->interestEvents();
+        if (found->second->getState() == ConnectionState::CLOSING &&
+            found->second->peerClosed && events == 0) {
+            if (found->second->pollerRegistered) {
+                poller->remove(connectionId);
+                found->second->pollerRegistered = false;
+            }
+            return;
         }
+        if (events == 0) {
+            if (found->second->pollerRegistered) {
+                poller->remove(connectionId);
+                found->second->pollerRegistered = false;
+            }
+            return;
+        }
+        const bool updated = found->second->pollerRegistered
+            ? poller->modify(connectionId, events)
+            : poller->add(connectionId, found->second->transport->nativeHandle(), events);
+        if (!updated) {
+            closeConnection(connectionId);
+            return;
+        }
+        found->second->pollerRegistered = true;
     }
 
     /*
@@ -256,8 +275,11 @@ struct Reactor::Impl {
         if (found == connections.end()) {
             return;
         }
-        poller->remove(connectionId);
-        found->second->close(false);
+        if (found->second->pollerRegistered) {
+            poller->remove(connectionId);
+            found->second->pollerRegistered = false;
+        }
+        found->second->close();
         connections.erase(found);
         std::lock_guard<std::mutex> lock(inboxMutex);
         overflowConnections.erase(connectionId);
@@ -272,42 +294,6 @@ struct Reactor::Impl {
     void closeAllConnections() {
         while (!connections.empty()) {
             closeConnection(connections.begin()->first);
-        }
-    }
-
-    /*
-        函数：startDrain
-        参数：无
-        功能：首次进入排空时停止接入、设定截止时间并要求所有连接进入排空
-        返回：无
-    */
-    void startDrain() {
-        if (drainStarted) {
-            return;
-        }
-        drainStarted = true;
-        {
-            std::lock_guard<std::mutex> lock(inboxMutex);
-            acceptingPosts = false;
-        }
-        drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(DRAIN_TIMEOUT_SECONDS);
-
-        std::vector<ConnectionId> connectionIds;
-        connectionIds.reserve(connections.size());
-        for (const auto& entry : connections) {
-            connectionIds.push_back(entry.first);
-        }
-        for (ConnectionId connectionId : connectionIds) {
-            const auto found = connections.find(connectionId);
-            if (found == connections.end()) {
-                continue;
-            }
-            found->second->beginDrain(*executor);
-            if (found->second->getState() == ConnectionState::CLOSED) {
-                closeConnection(connectionId);
-            } else {
-                poller->modify(connectionId, found->second->interestEvents());
-            }
         }
     }
 
@@ -334,14 +320,30 @@ struct Reactor::Impl {
                 continue;
             }
             if (connection.getState() == ConnectionState::TLS_HANDSHAKE) {
-                if ((item.events & (POLL_READ | POLL_WRITE)) != 0) {
-                    connection.onReadable(*executor, 0);
+                if ((item.events & POLL_HANGUP) != 0) {
+                    closeConnection(item.connectionId);
+                } else if ((item.events & (POLL_READ | POLL_WRITE)) != 0) {
+                    if ((item.events & POLL_READ) != 0) {
+                        connection.onReadable(*executor, 0);
+                    } else {
+                        connection.onWritable(0);
+                    }
                     refreshInterest(item.connectionId);
                 }
                 continue;
             }
-            if ((item.events & (POLL_READ | POLL_HANGUP)) != 0) {
+            if ((item.events & (POLL_READ | POLL_HANGUP)) != 0 &&
+                connection.getState() != ConnectionState::CLOSED &&
+                (connection.getState() != ConnectionState::CLOSING ||
+                 connection.pendingTransportOperation != Connection::PendingTransportOperation::NONE)) {
                 connection.onReadable(*executor, READ_BUDGET_BYTES);
+            }
+            if (connection.getState() == ConnectionState::CLOSING && connection.peerClosed) {
+                if ((item.events & POLL_WRITE) != 0) {
+                    connection.onWritable(WRITE_BUDGET_BYTES);
+                }
+                refreshInterest(item.connectionId);
+                continue;
             }
             if (connection.getState() != ConnectionState::CLOSED && (item.events & POLL_WRITE) != 0) {
                 connection.onWritable(WRITE_BUDGET_BYTES);
@@ -353,27 +355,16 @@ struct Reactor::Impl {
     /*
         函数：run
         参数：无
-        功能：事件循环主体，处理入队任务、停止排空和 I/O 事件
+        功能：事件循环主体，处理入队任务和 I/O 事件；收到停止信号后立即退出
         返回：无
     */
     void run() {
         std::array<PollEventItem, POLL_EVENT_BATCH> events{};
-        while (true) {
-            drainInbox();
+        while (!stopping.load(std::memory_order_acquire)) {
+            processInbox();
             applyPendingClosures();
-
             if (stopping.load(std::memory_order_acquire)) {
-                if (!drain.load(std::memory_order_acquire)) {
-                    break;
-                }
-                startDrain();
-                if (connections.empty()) {
-                    break;
-                }
-                if (std::chrono::steady_clock::now() >= drainDeadline) {
-                    closeAllConnections();
-                    break;
-                }
+                break;
             }
 
             const int count = poller->wait(events.data(), static_cast<int>(events.size()), POLL_WAIT_MS);
@@ -394,7 +385,7 @@ Reactor::Reactor(ReactorId id, std::unique_ptr<Poller> poller,
     : impl(std::make_shared<Impl>(id, std::move(poller), std::move(executor))) {}
 
 Reactor::~Reactor() {
-    stop(false);
+    stop();
 }
 
 /*
@@ -414,11 +405,9 @@ void Reactor::start() {
         state->worker.join();
     }
     state->stopping.store(false, std::memory_order_release);
-    state->drain.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(state->inboxMutex);
         state->acceptingPosts = true;
-        state->drainStarted = false;
         state->overflowConnections.clear();
     }
     try {
@@ -433,16 +422,14 @@ void Reactor::start() {
 
 /*
     函数：stop
-    参数：drain：是否优雅排空停止前已提交的请求
-    功能：停止接收新任务、唤醒事件线程并等待其退出
+    参数：无
+    功能：停止接收新任务、唤醒事件线程并等待连接立即关闭
     返回：无
-    备注：排空期间仍接收停止前已提交请求的完成结果，超时或非排空停止时立即关闭连接
 */
-void Reactor::stop(bool drain) {
+void Reactor::stop() {
     const auto state = impl;
     {
         std::lock_guard<std::mutex> lock(state->inboxMutex);
-        state->drain.store(drain, std::memory_order_release);
         state->stopping.store(true, std::memory_order_release);
         state->acceptingPosts = false;
     }
@@ -451,7 +438,6 @@ void Reactor::stop(bool drain) {
         return;
     }
     if (state->worker.get_id() == std::this_thread::get_id()) {
-        // 在事件线程内请求停止时不能自等待，交由线程自行结束。
         state->worker.detach();
         return;
     }
@@ -527,9 +513,10 @@ bool Reactor::addConnection(ConnectionId connectionId, std::unique_ptr<Transport
         }
         if (!state->poller->add(connectionId, connection->transport->nativeHandle(),
                                 connection->interestEvents())) {
-            connection->close(false);
+            connection->close();
             return;
         }
+        connection->pollerRegistered = true;
         state->connections.emplace(connectionId, std::move(connection));
     }, InboxKind::CONTROL);
     if (!queued) {
@@ -540,24 +527,13 @@ bool Reactor::addConnection(ConnectionId connectionId, std::unique_ptr<Transport
 
 /*
     函数：closeConnection
-    参数：connectionId：目标连接；graceful：是否优雅关闭
-    功能：请求关闭指定连接，优雅关闭先写完剩余响应
+    参数：connectionId：目标连接
+    功能：向所属 Reactor 投递立即关闭指定连接的任务
     返回：是否成功提交关闭请求；已停止或队列已满时返回 false
 */
-bool Reactor::closeConnection(ConnectionId connectionId, bool graceful) {
+bool Reactor::closeConnection(ConnectionId connectionId) {
     const auto state = impl;
-    return state->enqueue([state, connectionId, graceful] {
-        const auto found = state->connections.find(connectionId);
-        if (found == state->connections.end()) {
-            return;
-        }
-        if (graceful) {
-            found->second->beginDrain(*state->executor);
-            if (found->second->getState() != ConnectionState::CLOSED) {
-                state->poller->modify(connectionId, found->second->interestEvents());
-                return;
-            }
-        }
+    return state->enqueue([state, connectionId] {
         state->closeConnection(connectionId);
     }, InboxKind::CONTROL);
 }

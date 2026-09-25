@@ -131,7 +131,7 @@ TransportResult TcpTransport::read(ByteBuffer& buffer, std::size_t maxBytes) {
 #endif
 }
 
-TransportResult TcpTransport::write(const ByteBuffer& buffer, std::size_t& offset) {
+TransportResult TcpTransport::write(std::span<const std::uint8_t> buffer, std::size_t& offset) {
 #if defined(__linux__) && !defined(_WIN32)
     if (!available || offset > buffer.size()) {
         return TransportResult::FAILED;

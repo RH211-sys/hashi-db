@@ -50,7 +50,7 @@ public:
     std::intptr_t nativeHandle() const noexcept override;
     TransportResult handshake() override;
     TransportResult read(ByteBuffer& buffer, std::size_t maxBytes) override;
-    TransportResult write(const ByteBuffer& buffer, std::size_t& offset) override;
+    TransportResult write(std::span<const std::uint8_t> buffer, std::size_t& offset) override;
     std::uint8_t events() const override;
     void close() override;
 };

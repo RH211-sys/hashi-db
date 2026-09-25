@@ -19,6 +19,7 @@ target_include_directories(mydb_net_core PUBLIC
 
 add_library(mydb_net_linux STATIC EXCLUDE_FROM_ALL
     transport/tcp_transport.cpp
+    transport/tls_transport.cpp
     reactor/epoll_poller.cpp
     reactor/reactor_group.cpp
     server/acceptor.cpp
@@ -30,6 +31,9 @@ target_include_directories(mydb_net_linux PUBLIC
 )
 
 target_link_libraries(mydb_net_linux PUBLIC mydb_net_core)
+
+find_package(OpenSSL 1.1.1 REQUIRED)
+target_link_libraries(mydb_net_linux PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
 # 存储桥接是本层临时适配器：它引用存储层 Controller 与 cereal 序列化头文件，
 # 因此单独成目标，避免纯网络目标被拖上存储层依赖。

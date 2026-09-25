@@ -6,6 +6,7 @@
 #include "network_server.h"
 
 #include "../transport/tcp_transport.h"
+#include "../transport/tls_transport.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -26,7 +27,7 @@ NetworkServer::NetworkServer(ServerConfig config, std::shared_ptr<ICommandExecut
     : config(std::move(config)), executor(std::move(executor)) {}
 
 NetworkServer::~NetworkServer() {
-    stop(false);
+    stop();
 }
 
 /*
@@ -47,9 +48,18 @@ bool NetworkServer::start() {
     if (state != ServerState::CREATED || !executor || config.reactorCount > UINT32_MAX || config.maxClients == 0 ||
         config.maxPipelineRequests == 0 || config.maxFrameBytes < BASE_HEADER_LENGTH ||
         config.maxFrameBytes > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
-        config.tlsRequired || !config.allowPlaintextForDevelopment ||
-        (!loopback && !config.allowInsecureRemote)) {
+        (config.tlsRequired && (config.tlsCertificateFile.empty() || config.tlsPrivateKeyFile.empty())) ||
+        (!config.tlsRequired && !config.allowPlaintextForDevelopment) ||
+        (!config.tlsRequired && !loopback && !config.allowInsecureRemote)) {
         return false;
+    }
+
+    tlsContext.reset();
+    if (config.tlsRequired) {
+        tlsContext = TlsServerContext::create(config.tlsCertificateFile, config.tlsPrivateKeyFile);
+        if (!tlsContext) {
+            return false;
+        }
     }
 
     std::size_t reactorCount = config.reactorCount;
@@ -65,6 +75,9 @@ bool NetworkServer::start() {
 
     acceptor = std::make_unique<Acceptor>(config.listenEndpoint, 1024,
         [this](std::unique_ptr<Transport> transport, const Endpoint& peer, ClientSlotRelease releaseSlot) {
+            if (config.tlsRequired) {
+                transport = std::make_unique<TlsTransport>(std::move(transport), tlsContext);
+            }
             const ConnectionId connectionId = nextConnectionId.fetch_add(1, std::memory_order_relaxed);
             if (!reactorGroup->dispatch(std::move(transport), peer, config.maxPipelineRequests,
                                         connectionId, releaseSlot, config.maxFrameBytes)) {
@@ -75,7 +88,7 @@ bool NetworkServer::start() {
     acceptor->activeClients = &activeClients;
     if (!acceptor->start()) {
         acceptor.reset();
-        reactorGroup->stop(false);
+        reactorGroup->stop();
         reactorGroup.reset();
         return false;
     }
@@ -85,11 +98,11 @@ bool NetworkServer::start() {
 
 /*
     函数：stop
-    参数：graceful：是否优雅停止
-    功能：关闭 listener 并停止 ReactorGroup
+    参数：无
+    功能：停止 listener、立即关闭连接并停止 ReactorGroup
     返回：无
 */
-void NetworkServer::stop(bool graceful) {
+void NetworkServer::stop() {
     if (state == ServerState::STOPPED) {
         return;
     }
@@ -97,16 +110,15 @@ void NetworkServer::stop(bool graceful) {
         state = ServerState::STOPPED;
         return;
     }
-    state = graceful ? ServerState::DRAINING : ServerState::STOPPED;
+    state = ServerState::STOPPED;
     if (acceptor) {
         acceptor->stop();
         acceptor.reset();
     }
     if (reactorGroup) {
-        reactorGroup->stop(graceful);
+        reactorGroup->stop();
         reactorGroup.reset();
     }
-    state = ServerState::STOPPED;
 }
 
 /*

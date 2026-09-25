@@ -159,7 +159,8 @@ void StorageControllerExecutor::execute(CommandRequest request, CommandCompletio
     }
 
     const std::string key = keyFrom(request);
-    CommandRequest pendingRequest = request;
+    const ConnectionId connectionId = request.connectionId;
+    const RequestId requestId = request.requestId;
     auto completionHolder = std::make_shared<CommandCompletion>(std::move(completion));
     const bool accepted = workerPool->submit([this, request = std::move(request), key = std::move(key),
                                               completionHolder]() mutable {
@@ -200,7 +201,12 @@ void StorageControllerExecutor::execute(CommandRequest request, CommandCompletio
     });
 
     if (!accepted) {
-        (*completionHolder)(statusResponse(pendingRequest, ErrorCode::BUSY, "storage executor queue is full"));
+        CommandResponse response;
+        response.connectionId = connectionId;
+        response.requestId = requestId;
+        response.status = ErrorCode::BUSY;
+        response.message = "storage executor queue is full";
+        (*completionHolder)(std::move(response));
     }
 }
 

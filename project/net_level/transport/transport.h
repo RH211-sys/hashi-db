@@ -10,6 +10,7 @@
 #include "../common/net_types.h"
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace mydb::net {
 
@@ -77,11 +78,11 @@ public:
 
     /*
         函数：write
-        参数：buffer：待发送字节；offset：已发送位置
-        功能：向传输层写出一段字节，不允许阻塞等待
+        参数：buffer：待发送字节视图；offset：已发送位置
+        功能：向传输层写出一段字节，不复制缓冲内容且不允许阻塞等待
         返回：TransportResult
     */
-    virtual TransportResult write(const ByteBuffer& buffer, std::size_t& offset) = 0;
+    virtual TransportResult write(std::span<const std::uint8_t> buffer, std::size_t& offset) = 0;
 
     /*
         函数：events

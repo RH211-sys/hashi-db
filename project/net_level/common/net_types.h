@@ -34,7 +34,6 @@ struct Endpoint {
 enum class ServerState : std::uint8_t {
     CREATED,                                     // 已创建：配置已保存，服务尚未启动
     RUNNING,                                     // 运行中：正在接受连接和处理请求
-    DRAINING,                                    // 排空中：停止接收新请求，等待已提交请求完成
     STOPPED                                      // 已停止：监听器、Reactor 和连接均已关闭
 };
 

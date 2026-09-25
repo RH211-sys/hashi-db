@@ -57,11 +57,11 @@ public:
 
     /*
         函数：stop
-        参数：graceful：是否优雅停止
-        功能：停止网络服务并按顺序释放连接、Reactor 和监听资源
+        参数：无
+        功能：立即停止网络服务并按顺序释放连接、Reactor 和监听资源
         返回：无
     */
-    void stop(bool graceful = true);
+    void stop();
 
     /*
         函数：wait

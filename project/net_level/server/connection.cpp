@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <span>
 #include <utility>
 
 namespace mydb::net {
@@ -121,7 +122,48 @@ Connection::Connection(ConnectionId id, ReactorId ownerReactor, std::unique_ptr<
 }
 
 Connection::~Connection() {
-    close(false);
+    close();
+}
+
+/*
+    功能：使用原有长度重试等待写就绪的 TLS 读取
+    传参：bytesRead：本次读取的明文字节数输出
+    返回值：传输操作结果
+*/
+TransportResult Connection::retryPendingRead(std::size_t& bytesRead) {
+    const std::size_t originalSize = pendingInput.size();
+    const TransportResult result = transport->read(pendingInput, pendingTransportBytes);
+    bytesRead = pendingInput.size() - originalSize;
+    if (result != TransportResult::WOULD_BLOCK) {
+        pendingTransportOperation = PendingTransportOperation::NONE;
+        pendingTransportBytes = 0;
+    }
+    return result;
+}
+
+/*
+    功能：使用原缓冲区和原长度重试等待读就绪的 TLS 写入
+    传参：bytesWritten：本次写出的字节数输出
+    返回值：传输操作结果
+*/
+TransportResult Connection::retryPendingWrite(std::size_t& bytesWritten) {
+    ByteBuffer& bytes = outputQueue.front();
+    std::size_t& offset = outputOffsets.front();
+    const std::span<const std::uint8_t> chunk(bytes.data() + offset, pendingTransportBytes);
+    std::size_t chunkOffset = 0;
+    const TransportResult result = transport->write(chunk, chunkOffset);
+    offset += chunkOffset;
+    queuedOutputBytes -= chunkOffset;
+    bytesWritten = chunkOffset;
+    if (offset == bytes.size()) {
+        outputQueue.pop_front();
+        outputOffsets.pop_front();
+    }
+    if (result != TransportResult::WOULD_BLOCK) {
+        pendingTransportOperation = PendingTransportOperation::NONE;
+        pendingTransportBytes = 0;
+    }
+    return result;
 }
 
 /*
@@ -133,7 +175,7 @@ Connection::~Connection() {
 */
 void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) {
     executorForResume = &executor;
-    if (state == ConnectionState::CLOSED || state == ConnectionState::CLOSING) {
+    if (state == ConnectionState::CLOSED) {
         return;
     }
     if (state == ConnectionState::TLS_HANDSHAKE) {
@@ -141,21 +183,73 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
         if (result == TransportResult::OK) {
             state = ConnectionState::WAIT_HELLO;
         } else if (result != TransportResult::WOULD_BLOCK) {
-            close(false);
+            close();
         }
+        return;
+    }
+    if (pendingTransportOperation != PendingTransportOperation::NONE) {
+        if ((transport->events() & WANT_READ) == 0) {
+            return;
+        }
+        if (pendingTransportOperation == PendingTransportOperation::WRITE) {
+            std::size_t bytesWritten = 0;
+            const TransportResult result = retryPendingWrite(bytesWritten);
+            if (result == TransportResult::WOULD_BLOCK) {
+                return;
+            }
+            if (result == TransportResult::FAILED || result == TransportResult::PEER_CLOSED) {
+                close();
+                return;
+            }
+            onWritable(0);
+            if (state == ConnectionState::CLOSED) {
+                return;
+            }
+        } else {
+            std::size_t bytesRead = 0;
+            const TransportResult result = retryPendingRead(bytesRead);
+            readBudget -= std::min(readBudget, bytesRead);
+            if (bytesRead != 0 && state != ConnectionState::CLOSING && !processInput(executor)) {
+                return;
+            }
+            if (state == ConnectionState::CLOSED) {
+                return;
+            }
+            if (result == TransportResult::PEER_CLOSED) {
+                onPeerHalfClose();
+                return;
+            }
+            if (result == TransportResult::FAILED) {
+                close();
+                return;
+            }
+            if (result == TransportResult::WOULD_BLOCK) {
+                return;
+            }
+            if (state == ConnectionState::CLOSING) {
+                pendingInput.clear();
+                pendingInputOffset = 0;
+                return;
+            }
+        }
+    }
+    if (state == ConnectionState::CLOSING) {
         return;
     }
     if (!processInput(executor)) {
         return;
     }
     if (state == ConnectionState::CLOSED || state == ConnectionState::CLOSING ||
-        readPaused || draining || peerClosed || readBudget == 0) {
+        readPaused || peerClosed || readBudget == 0) {
+        if (peerClosed && !activeRequestId && outputQueue.empty()) {
+            close();
+        }
         return;
     }
 
     std::size_t remaining = readBudget;
     while (remaining > 0 && state != ConnectionState::CLOSED && state != ConnectionState::CLOSING &&
-           !readPaused && !draining && !peerClosed) {
+           !readPaused && !peerClosed) {
         if (pendingInput.size() >= maxBufferedInputBytes) {
             // 输入上限已满：暂停读取，等待在途请求完成后继续解析。
             readPaused = true;
@@ -169,29 +263,55 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
         if (count != 0 && !processInput(executor)) {
             return;
         }
-        if (state == ConnectionState::CLOSED || state == ConnectionState::CLOSING) {
-            return;
-        }
-        if (result == TransportResult::FAILED) {
-            close(false);
+        if (state == ConnectionState::CLOSED) {
             return;
         }
         if (result == TransportResult::PEER_CLOSED) {
-            peerClosed = true;
-            draining = true;
-            readPaused = true;
-            closeAfterOutput = true;
-            if (!activeRequest && pipeline.empty() && outputQueue.empty()) {
-                close(false);
-            } else {
-                state = ConnectionState::CLOSING;
-            }
+            onPeerHalfClose();
             return;
         }
-        if (result == TransportResult::WOULD_BLOCK || count == 0) {
+        if (state == ConnectionState::CLOSING) {
+            return;
+        }
+        if (result == TransportResult::FAILED) {
+            close();
+            return;
+        }
+        if (result == TransportResult::WOULD_BLOCK) {
+            const std::uint8_t wants = transport->events();
+            if ((wants & WANT_WRITE) != 0 && (wants & WANT_READ) == 0) {
+                pendingTransportOperation = PendingTransportOperation::READ;
+                pendingTransportBytes = amount;
+            }
+            break;
+        }
+        if (count == 0) {
             break;
         }
     }
+}
+
+/*
+    函数：onPeerHalfClose
+    参数：无
+    功能：记录对端半关闭、丢弃尚未派发的请求并保留当前请求的响应路径
+    返回：无
+*/
+void Connection::onPeerHalfClose() {
+    if (peerClosed || state == ConnectionState::CLOSED) {
+        return;
+    }
+    peerClosed = true;
+    readPaused = true;
+    closeAfterOutput = true;
+    pendingInput.clear();
+    pendingInputOffset = 0;
+    pipeline.clear();
+    if (activeRequestId || !outputQueue.empty()) {
+        state = ConnectionState::CLOSING;
+        return;
+    }
+    close();
 }
 
 /*
@@ -203,7 +323,7 @@ void Connection::onReadable(ICommandExecutor& executor, std::size_t readBudget) 
 bool Connection::processInput(ICommandExecutor& executor) {
     executorForResume = &executor;
     while (pendingInputOffset < pendingInput.size() &&
-           pipeline.size() + (activeRequest ? 1U : 0U) < maxPipelineRequests &&
+           pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) < maxPipelineRequests &&
            state != ConnectionState::CLOSED && state != ConnectionState::CLOSING) {
         Frame frame;
         const DecodeStatus status = codec.feed(pendingInput, pendingInputOffset, frame);
@@ -212,7 +332,7 @@ bool Connection::processInput(ICommandExecutor& executor) {
         }
         if (status != DecodeStatus::FRAME_READY) {
             // 帧非法：无法在字节流中重新同步，只能关闭连接。
-            close(false);
+            close();
             return false;
         }
         if (!handleFrame(std::move(frame), executor)) {
@@ -222,7 +342,7 @@ bool Connection::processInput(ICommandExecutor& executor) {
             break;
         }
         // 同一连接最多一个在途请求，因此本次解析到此为止，剩余字节留给完成回投后继续处理。
-        if (activeRequest) {
+        if (activeRequestId.has_value()) {
             break;
         }
     }
@@ -235,7 +355,7 @@ bool Connection::processInput(ICommandExecutor& executor) {
                            pendingInput.begin() + static_cast<std::ptrdiff_t>(pendingInputOffset));
         pendingInputOffset = 0;
     }
-    readPaused = pipeline.size() + (activeRequest ? 1U : 0U) >= maxPipelineRequests;
+    readPaused = pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) >= maxPipelineRequests;
     dispatchNext(executor);
     return state != ConnectionState::CLOSED;
 }
@@ -250,8 +370,10 @@ bool Connection::handleFrame(Frame frame, ICommandExecutor& executor) {
     CommandRequest request;
     ErrorCode error = ErrorCode::OK;
     std::string message;
-    if (!parser.parse(frame, id, request, error, message, static_cast<std::uint32_t>(maxFrameBytes))) {
-        queueProtocolError(frame.header.requestId, frame.header.opcode, error, std::move(message));
+    const RequestId requestId = frame.header.requestId;
+    const Opcode opcode = frame.header.opcode;
+    if (!parser.parse(std::move(frame), id, request, error, message, static_cast<std::uint32_t>(maxFrameBytes))) {
+        queueProtocolError(requestId, opcode, error, std::move(message));
         return false;
     }
     request.principal = session.getPrincipal();
@@ -295,12 +417,13 @@ void Connection::queueProtocolError(RequestId requestId, Opcode opcode, ErrorCod
 
     ByteBuffer encoded = codec.encode(frame);
     if (encoded.empty() || encoded.size() > MAX_OUTPUT_BYTES - queuedOutputBytes) {
-        close(false);
+        close();
         return;
     }
     queuedOutputBytes += encoded.size();
     outputQueue.push_back(std::move(encoded));
     outputOffsets.push_back(0);
+    activeRequestId.reset();
     closeAfterOutput = true;
     readPaused = true;
     pipeline.clear();
@@ -312,7 +435,7 @@ void Connection::queueProtocolError(RequestId requestId, Opcode opcode, ErrorCod
 /*
     函数：onWritable
     参数：writeBudget：本次最多写出的字节数
-    功能：按预算写出输出缓冲，必要时推进握手或触发关闭
+    功能：按预算写出输出缓冲，必要时推进握手或完成关闭
     返回：无
 */
 void Connection::onWritable(std::size_t writeBudget) {
@@ -324,44 +447,89 @@ void Connection::onWritable(std::size_t writeBudget) {
         if (result == TransportResult::OK) {
             state = ConnectionState::WAIT_HELLO;
         } else if (result != TransportResult::WOULD_BLOCK) {
-            close(false);
+            close();
         }
         return;
+    }
+
+    if (pendingTransportOperation != PendingTransportOperation::NONE) {
+        if ((transport->events() & WANT_WRITE) == 0) {
+            return;
+        }
+        if (pendingTransportOperation == PendingTransportOperation::READ) {
+            std::size_t bytesRead = 0;
+            const TransportResult result = retryPendingRead(bytesRead);
+            if (bytesRead != 0 && state != ConnectionState::CLOSING && !processInput(*executorForResume)) {
+                return;
+            }
+            if (state == ConnectionState::CLOSED) {
+                return;
+            }
+            if (result == TransportResult::PEER_CLOSED) {
+                onPeerHalfClose();
+            } else if (result == TransportResult::FAILED) {
+                close();
+                return;
+            } else if (result == TransportResult::WOULD_BLOCK) {
+                return;
+            }
+            if (state == ConnectionState::CLOSING) {
+                pendingInput.clear();
+                pendingInputOffset = 0;
+            }
+        } else {
+            std::size_t bytesWritten = 0;
+            const TransportResult result = retryPendingWrite(bytesWritten);
+            writeBudget -= std::min(writeBudget, bytesWritten);
+            if (result == TransportResult::FAILED || result == TransportResult::PEER_CLOSED) {
+                close();
+                return;
+            }
+            if (result == TransportResult::WOULD_BLOCK) {
+                return;
+            }
+        }
     }
 
     while (writeBudget > 0 && !outputQueue.empty()) {
         ByteBuffer& bytes = outputQueue.front();
         std::size_t& offset = outputOffsets.front();
         const std::size_t amount = std::min(writeBudget, bytes.size() - offset);
-        ByteBuffer chunk(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-                         bytes.begin() + static_cast<std::ptrdiff_t>(offset + amount));
+        const std::span<const std::uint8_t> chunk(bytes.data() + offset, amount);
         std::size_t chunkOffset = 0;
         const TransportResult result = transport->write(chunk, chunkOffset);
         offset += chunkOffset;
         queuedOutputBytes -= chunkOffset;
         writeBudget -= chunkOffset;
         if (result == TransportResult::FAILED || result == TransportResult::PEER_CLOSED) {
-            close(false);
+            close();
             return;
         }
         if (offset == bytes.size()) {
             outputQueue.pop_front();
             outputOffsets.pop_front();
         }
-        if (result == TransportResult::WOULD_BLOCK || chunkOffset == 0) {
+        if (state == ConnectionState::CLOSED) {
+            return;
+        }
+        if (result == TransportResult::WOULD_BLOCK) {
+            const std::uint8_t wants = transport->events();
+            if (wants == WANT_READ || wants == WANT_WRITE) {
+                pendingTransportOperation = PendingTransportOperation::WRITE;
+                pendingTransportBytes = amount;
+            }
+            break;
+        }
+        if (chunkOffset == 0) {
             break;
         }
     }
 
-    if (closeAfterOutput && outputQueue.empty() && !activeRequest) {
-        close(false);
+    if (closeAfterOutput && outputQueue.empty() && !activeRequestId) {
+        close();
         return;
     }
-    if (peerClosed && !activeRequest && pipeline.empty() && outputQueue.empty()) {
-        close(false);
-        return;
-    }
-    if (!draining && !closeAfterOutput && !activeRequest) {
+    if (!closeAfterOutput && !activeRequestId) {
         // 输出腾出空间后恢复解析输入，并调度下一个待执行请求。
         readPaused = false;
         if (!processInput(*executorForResume)) {
@@ -378,38 +546,47 @@ void Connection::onWritable(std::size_t writeBudget) {
     备注：响应必须对应在途请求；无法对应时按协议错误处理并关闭连接
 */
 void Connection::complete(CommandResponse response) {
-    if (state == ConnectionState::CLOSED || !activeRequest) {
+    if (state == ConnectionState::CLOSED || !activeRequestId) {
         return;
     }
-    if (response.connectionId != id || response.requestId != activeRequest->requestId) {
+    if (response.connectionId != id || response.requestId != *activeRequestId) {
         // 结果无法与在途请求对应：状态不可恢复，按协议错误收尾。
-        const RequestId inFlightId = activeRequest->requestId;
-        const Opcode inFlightOpcode = activeRequest->opcode;
-        activeRequest.reset();
+        const RequestId inFlightId = *activeRequestId;
+        const Opcode inFlightOpcode = activeOpcode;
+        activeRequestId.reset();
         queueProtocolError(inFlightId, inFlightOpcode, ErrorCode::INTERNAL,
                            "response does not match in-flight request");
         return;
     }
 
-    const Opcode completedOpcode = activeRequest->opcode;
+    if (peerClosed) {
+        closeAfterOutput = true;
+        pipeline.clear();
+        pendingInput.clear();
+        pendingInputOffset = 0;
+    }
+
+    if (state == ConnectionState::CLOSING && !peerClosed) {
+        return;
+    }
+
+    const Opcode completedOpcode = activeOpcode;
     if (response.status == ErrorCode::OK && completedOpcode == Opcode::HELLO) {
-        const TlvField* version = findField(*activeRequest, FieldId::PROTOCOL_VERSION);
-        const TlvField* features = findField(*activeRequest, FieldId::FEATURE_BITS);
-        if (version == nullptr || version->value.size() != 2 ||
-            !session.negotiate(static_cast<std::uint16_t>((version->value[0] << 8U) | version->value[1]),
-                               features == nullptr ? 0 : readU64(features->value))) {
+        if (!pendingFeatureBits || !session.negotiate(PROTOCOL_VERSION, *pendingFeatureBits)) {
             response.status = ErrorCode::UNSUPPORTED;
             response.message = "protocol negotiation failed";
         } else {
             state = ConnectionState::WAIT_AUTH;
         }
     } else if (response.status == ErrorCode::OK && completedOpcode == Opcode::AUTH) {
-        const TlvField* username = findField(*activeRequest, FieldId::USERNAME);
-        if (username != nullptr) {
-            session.authenticate(std::string(username->value.begin(), username->value.end()));
+        if (pendingAuthentication) {
+            session.authenticate(std::move(pendingPrincipal));
             state = ConnectionState::READY;
         }
     }
+    pendingFeatureBits.reset();
+    pendingPrincipal.clear();
+    pendingAuthentication = false;
 
     Frame frame;
     frame.header.version = static_cast<std::uint8_t>(PROTOCOL_VERSION);
@@ -417,7 +594,7 @@ void Connection::complete(CommandResponse response) {
     frame.header.opcode = completedOpcode;
     frame.header.requestId = response.requestId;
     if (hasReservedResponseFields(response.fields)) {
-        activeRequest.reset();
+        activeRequestId.reset();
         queueProtocolError(response.requestId, completedOpcode, ErrorCode::INTERNAL,
                            "response used reserved fields");
         return;
@@ -435,8 +612,8 @@ void Connection::complete(CommandResponse response) {
 
     ByteBuffer encoded = codec.encode(frame);
     if (encoded.empty() || encoded.size() > MAX_OUTPUT_BYTES - queuedOutputBytes) {
-        activeRequest.reset();
-        close(false);
+        activeRequestId.reset();
+        close();
         return;
     }
     queuedOutputBytes += encoded.size();
@@ -444,29 +621,16 @@ void Connection::complete(CommandResponse response) {
     outputOffsets.push_back(0);
     closeAfterOutput = closeAfterOutput || response.closeAfterWrite ||
                        completedOpcode == Opcode::QUIT || peerClosed;
-    activeRequest.reset();
+    activeRequestId.reset();
 
     if (closeAfterOutput) {
-        // 写完剩余响应即关闭；后续未执行请求直接丢弃。
+        // 写完剩余响应即关闭；服务器关闭指令、QUIT 和对端 FIN 均不继续调度请求。
         state = ConnectionState::CLOSING;
         pipeline.clear();
         pendingInput.clear();
         pendingInputOffset = 0;
         if (outputQueue.empty()) {
-            close(false);
-        }
-        return;
-    }
-    if (draining) {
-        // 排空期间不再读取新输入，只把已接收的请求依次执行完。
-        if (!pipeline.empty()) {
-            dispatchNext(*executorForResume);
-            return;
-        }
-        closeAfterOutput = true;
-        state = ConnectionState::CLOSING;
-        if (outputQueue.empty()) {
-            close(false);
+            close();
         }
         return;
     }
@@ -476,55 +640,33 @@ void Connection::complete(CommandResponse response) {
 
 /*
     函数：close
-    参数：graceful：是否优雅关闭
+    参数：无
     功能：立即停止 I/O、丢弃缓冲并释放连接槽位
     返回：无
-    备注：优雅关闭由 beginDrain 驱动，本函数只做终态释放，可重复调用
 */
-void Connection::close(bool graceful) {
-    (void)graceful;
+void Connection::close() {
     if (state == ConnectionState::CLOSED) {
         return;
     }
     state = ConnectionState::CLOSED;
     pipeline.clear();
-    activeRequest.reset();
+    activeRequestId.reset();
+    pendingFeatureBits.reset();
+    pendingPrincipal.clear();
+    pendingAuthentication = false;
     pendingInput.clear();
     pendingInputOffset = 0;
     outputQueue.clear();
     outputOffsets.clear();
     queuedOutputBytes = 0;
+    pendingTransportOperation = PendingTransportOperation::NONE;
+    pendingTransportBytes = 0;
     if (transport) {
         transport->close();
     }
     if (releaseSlot) {
         auto release = std::move(releaseSlot);
         release();
-    }
-}
-
-/*
-    函数：beginDrain
-    参数：executor：命令执行器
-    功能：进入排空状态，停止读取并提交已接收但未执行的请求
-    返回：无
-    备注：排空期间仍接收停止前已提交请求的完成结果
-*/
-void Connection::beginDrain(ICommandExecutor& executor) {
-    draining = true;
-    readPaused = true;
-    executorForResume = &executor;
-    pendingInput.clear();
-    pendingInputOffset = 0;
-    if (!activeRequest && !pipeline.empty()) {
-        dispatchNext(executor);
-    }
-    if (!activeRequest && pipeline.empty()) {
-        closeAfterOutput = true;
-        state = ConnectionState::CLOSING;
-        if (outputQueue.empty()) {
-            close(false);
-        }
     }
 }
 
@@ -536,29 +678,50 @@ void Connection::beginDrain(ICommandExecutor& executor) {
 */
 void Connection::dispatchNext(ICommandExecutor& executor) {
     executorForResume = &executor;
-    if (state == ConnectionState::CLOSED || activeRequest || pipeline.empty() ||
-        (state == ConnectionState::CLOSING && !draining)) {
+    if (state == ConnectionState::CLOSED || activeRequestId.has_value() || pipeline.empty() ||
+        state == ConnectionState::CLOSING) {
         return;
     }
-    activeRequest = std::move(pipeline.front());
+    CommandRequest request = std::move(pipeline.front());
     pipeline.pop_front();
+    activeOpcode = request.opcode;
+    activeRequestId = request.requestId;
 
-    if (!session.canExecute(activeRequest->opcode, RequestSource::REMOTE)) {
+    if (!session.canExecute(request.opcode, RequestSource::REMOTE)) {
+        pendingFeatureBits.reset();
+        pendingPrincipal.clear();
+        pendingAuthentication = false;
         CommandResponse response;
         response.connectionId = id;
-        response.requestId = activeRequest->requestId;
+        response.requestId = request.requestId;
         response.status = session.isNegotiated() ? ErrorCode::NOAUTH : ErrorCode::BAD_FRAME;
         response.message = session.isNegotiated() ? "authentication required" : "HELLO required";
         complete(std::move(response));
         return;
     }
 
-    const CommandRequest request = *activeRequest;
-    const auto poster = completionPoster;
+    pendingFeatureBits.reset();
+    pendingPrincipal.clear();
+    pendingAuthentication = request.opcode == Opcode::AUTH;
+    if (request.opcode == Opcode::HELLO) {
+        const TlvField* features = findField(request, FieldId::FEATURE_BITS);
+        if (features != nullptr) {
+            pendingFeatureBits = readU64(features->value);
+        } else {
+            pendingFeatureBits = 0;
+        }
+    } else if (pendingAuthentication) {
+        const TlvField* username = findField(request, FieldId::USERNAME);
+        if (username != nullptr) {
+            pendingPrincipal.assign(username->value.begin(), username->value.end());
+        }
+    }
+
     const ConnectionId connectionId = id;
     const RequestId requestId = request.requestId;
+    const auto poster = completionPoster;
     try {
-        executor.execute(request, [poster, connectionId, requestId](CommandResponse response) mutable {
+        executor.execute(std::move(request), [poster, connectionId, requestId](CommandResponse response) mutable {
             if (response.connectionId == 0) {
                 response.connectionId = connectionId;
             }
@@ -570,6 +733,9 @@ void Connection::dispatchNext(ICommandExecutor& executor) {
             }
         });
     } catch (...) {
+        pendingFeatureBits.reset();
+        pendingPrincipal.clear();
+        pendingAuthentication = false;
         CommandResponse response;
         response.connectionId = connectionId;
         response.requestId = requestId;
@@ -603,9 +769,20 @@ std::uint32_t Connection::interestEvents() const {
         }
         return events;
     }
+    if (pendingTransportOperation != PendingTransportOperation::NONE) {
+        const std::uint8_t wants = transport->events();
+        std::uint32_t events = 0;
+        if ((wants & WANT_READ) != 0) {
+            events |= POLL_READ;
+        }
+        if ((wants & WANT_WRITE) != 0) {
+            events |= POLL_WRITE;
+        }
+        return events;
+    }
     std::uint32_t events = 0;
-    if (!readPaused && !draining && !peerClosed && state != ConnectionState::CLOSING &&
-        pipeline.size() + (activeRequest ? 1U : 0U) < maxPipelineRequests) {
+    if (!readPaused && !peerClosed && state != ConnectionState::CLOSING &&
+        pipeline.size() + (activeRequestId.has_value() ? 1U : 0U) < maxPipelineRequests) {
         events |= POLL_READ;
     }
     if (!outputQueue.empty() || (transport->events() & WANT_WRITE) != 0) {

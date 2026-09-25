@@ -37,6 +37,12 @@ using ConnectionCompletionPoster = std::function<void(CommandResponse)>; // 完�
 */
 class Connection {
 private:
+    enum class PendingTransportOperation : std::uint8_t {
+        NONE,
+        READ,
+        WRITE
+    };
+
     ConnectionId id;                                   // 连接标识：进程内唯一
     ReactorId ownerReactor;                            // 所属 Reactor：连接线程亲和性的依据
     ConnectionState state;                             // 连接状态：控制读取、调度和关闭
@@ -51,7 +57,11 @@ private:
     std::size_t pendingInputOffset = 0;                // 输入消费位置：当前字节块已解析到的下标
     std::deque<ByteBuffer> outputQueue;                // 输出队列：待发送的完整响应帧
     std::deque<std::size_t> outputOffsets;             // 输出进度：与输出队列一一对应的已发送字节数
-    std::optional<CommandRequest> activeRequest;       // 在途请求：同一时刻最多一个
+    Opcode activeOpcode = Opcode::PING;                // 在途命令：请求移动到执行器后保留
+    std::optional<RequestId> activeRequestId;          // 在途请求标识：关联异步完成响应
+    std::optional<std::uint64_t> pendingFeatureBits;   // HELLO 能力位：请求移动后保留
+    std::string pendingPrincipal;                      // AUTH 主体：请求移动后保留
+    bool pendingAuthentication = false;                // AUTH 状态：标记是否等待认证结果
     ICommandExecutor* executorForResume = nullptr;     // 执行器引用：完成回投后继续调度使用
     std::function<void()> releaseSlot;                 // 槽位释放回调：连接关闭时调用一次
     ConnectionCompletionPoster completionPoster;       // 完成投递器：回投到所属 Reactor
@@ -60,9 +70,11 @@ private:
     std::size_t maxFrameBytes;                         // 帧上限：单帧最大字节数
     std::size_t maxBufferedInputBytes;                 // 输入上限：单连接未解析输入的最大字节数
     bool closeAfterOutput = false;                     // 写完即关：输出清空后关闭连接
+    bool pollerRegistered = false;                     // 轮询注册状态：当前是否加入 Reactor 事件轮询
     bool readPaused = false;                           // 读取暂停：队列或缓冲达到上限时停止关注可读
-    bool draining = false;                             // 排空中：停止接收新请求，继续完成已接收请求
-    bool peerClosed = false;                           // 对端已关闭：只允许写完剩余响应
+    bool peerClosed = false;                           // 对端关闭发送方向：只完成当前请求并回应后关闭
+    PendingTransportOperation pendingTransportOperation = PendingTransportOperation::NONE; // 挂起操作：等待 OpenSSL 所需的交叉 I/O 就绪
+    std::size_t pendingTransportBytes = 0;              // 挂起长度：重试时保持相同的缓冲区长度
 
     friend class Reactor;
     friend class ReactorGroup;
@@ -72,7 +84,8 @@ private:
     bool processInput(ICommandExecutor& executor);
     bool handleFrame(Frame frame, ICommandExecutor& executor);
     void queueProtocolError(RequestId requestId, Opcode opcode, ErrorCode error, std::string message);
-    void beginDrain(ICommandExecutor& executor);
+    TransportResult retryPendingRead(std::size_t& bytesRead);
+    TransportResult retryPendingWrite(std::size_t& bytesWritten);
     std::uint32_t interestEvents() const;
 
 public:
@@ -87,9 +100,10 @@ public:
     Connection& operator=(const Connection&) = delete;
 
     void onReadable(ICommandExecutor& executor, std::size_t readBudget);
+    void onPeerHalfClose();
     void onWritable(std::size_t writeBudget);
     void complete(CommandResponse response);
-    void close(bool graceful);
+    void close();
     ConnectionId getId() const;
     ConnectionState getState() const;
 };

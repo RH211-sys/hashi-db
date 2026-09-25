@@ -36,12 +36,12 @@ public:
     Reactor& operator=(Reactor&&) = delete;
 
     void start();
-    void stop(bool drain);
+    void stop();
     bool post(ReactorTask task);
     bool addConnection(ConnectionId connectionId, std::unique_ptr<Transport> transport, Endpoint peer,
                        std::size_t maxPipelineRequests, ClientSlotRelease releaseSlot = {},
                        std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES);
-    bool closeConnection(ConnectionId connectionId, bool graceful);
+    bool closeConnection(ConnectionId connectionId);
     ReactorId getId() const noexcept;
 };
 

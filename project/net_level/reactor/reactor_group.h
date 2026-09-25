@@ -54,11 +54,11 @@ public:
 
     /*
         函数：stop
-        参数：drain：是否优雅排空已提交请求
-        功能：停止所有 Reactor 并等待其线程退出
+        参数：无
+        功能：立即停止所有 Reactor 并等待其线程退出
         返回：无
     */
-    void stop(bool drain);
+    void stop();
 
     /*
         函数：dispatch

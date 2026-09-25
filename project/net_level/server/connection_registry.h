@@ -54,11 +54,11 @@ public:
 
     /*
         函数：kill
-        参数：connectionId：待关闭连接标识；graceful：是否优雅关闭
-        功能：向连接所属 Reactor 投递关闭任务
+        参数：connectionId：待关闭连接标识
+        功能：向连接所属 Reactor 投递立即关闭任务
         返回：是否成功找到并投递
     */
-    virtual bool kill(ConnectionId connectionId, bool graceful) = 0;
+    virtual bool kill(ConnectionId connectionId) = 0;
 };
 
 }

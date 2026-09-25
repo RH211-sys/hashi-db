@@ -24,11 +24,11 @@ class CommandParser {
 public:
     /*
         函数：parse
-        参数：frame：FrameCodec 解析出的完整帧；connectionId：所属连接标识
-        功能：按照 opcode 定义校验字段，并构造命令请求
+        参数：frame：所有权转入解析器的完整帧；connectionId：所属连接标识
+        功能：按照 opcode 定义校验字段，并移动字段数据构造命令请求
         返回：成功返回 CommandRequest；失败返回对应 ErrorCode 和错误信息
     */
-    bool parse(const Frame& frame, ConnectionId connectionId, CommandRequest& request,
+    bool parse(Frame&& frame, ConnectionId connectionId, CommandRequest& request,
                ErrorCode& error, std::string& message,
                std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES) const;
 };

@@ -44,13 +44,13 @@ bool Controller::start() {
 
 /*
     函数：stop
-    参数：graceful：是否优雅停止
-    功能：停止网络服务端
+    参数：无
+    功能：立即停止网络服务端
     返回：无
 */
-void Controller::stop(bool graceful) {
+void Controller::stop() {
     if (server) {
-        server->stop(graceful);
+        server->stop();
     }
 }
 
