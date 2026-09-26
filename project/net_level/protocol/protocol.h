@@ -4,7 +4,8 @@
 
 /*
     模块名：网络协议基础类型
-    功能描述：定义固定帧头、命令码、TLV 字段和请求/响应对象；不负责字节流读取和业务执行。
+    模块地位：帧编解码、命令解析与执行器共享的协议数据类型边界。
+    模块功能描述：定义固定帧头、命令码、TLV 字段和请求/响应对象；不负责字节流读取和业务执行。
 */
 
 #include "../common/net_types.h"
@@ -65,6 +66,7 @@ enum class FieldType : std::uint8_t {
 
 /*
     类型名：FrameHeader
+    地位：网络帧编解码与协议处理之间的固定头部表示。
     功能：表示 24 字节基础帧头在主机内存中的结构化形式。
 */
 struct FrameHeader {
@@ -78,6 +80,7 @@ struct FrameHeader {
 
 /*
     类型名：TlvField
+    地位：Frame 与 CommandParser 之间的协议字段表示。
     功能：表示一个 TLV 编码字段。
 */
 struct TlvField {
@@ -88,6 +91,7 @@ struct TlvField {
 
 /*
     类型名：Frame
+    地位：帧编解码器与命令解析器之间的完整协议帧表示。
     功能：保存一个已完成解析或待编码的协议帧。
 */
 struct Frame {
@@ -97,6 +101,7 @@ struct Frame {
 
 /*
     类型名：CommandRequest
+    地位：网络层提交给执行层的结构化请求契约。
     功能：保存命令解析后的结构化请求，作为网络层到执行层的输入。
 */
 struct CommandRequest {
@@ -111,6 +116,7 @@ struct CommandRequest {
 
 /*
     类型名：CommandResponse
+    地位：执行层返回给网络层的结构化结果契约。
     功能：保存执行层返回给网络连接的结构化响应。
 */
 struct CommandResponse {

@@ -4,7 +4,8 @@
 
 /*
     模块名：网络帧编解码器
-    功能描述：增量解析 TCP 字节流中的固定头、TLV body 和完整帧，并将响应对象编码为可发送字节。
+    模块地位：TCP 字节流与协议帧之间的增量编解码模块。
+    模块功能描述：增量解析 TCP 字节流中的固定头、TLV body 和完整帧，并将响应对象编码为可发送字节。
 */
 
 #include "protocol.h"
@@ -27,6 +28,7 @@ enum class DecodeStatus : std::uint8_t {
 
 /*
     类名：FrameCodec
+    地位：Connection 字节流缓冲与协议 Frame 之间的编解码模块。
     功能：处理 TCP 字节流和协议 Frame 之间的转换。
         - 保存半包数据并支持拆包、粘包。
         - 校验固定头和 Body 长度。
@@ -41,41 +43,41 @@ private:
 public:
     /*
         函数：FrameCodec
-        参数：maxFrameBytes：单帧允许的最大字节数
+        传参：maxFrameBytes：单帧允许的最大字节数
         功能：创建帧编解码器并设置长度上限
-        返回：无
+        返回值：无
     */
     explicit FrameCodec(std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES);
 
     /*
         函数：feed
-        参数：data：新收到的字节；frame：解析成功后写入的完整帧
+        传参：data：新收到的字节；frame：解析成功后写入的完整帧
         功能：兼容接口，解析一个完整帧并缓存未消费尾部；为严格限制粘包内存，单次聚合输入最多缓存两个 maxFrameBytes
-        返回：DecodeStatus，表示需要更多数据、解析成功或协议错误；大量粘包请使用带 offset 的重载
+        返回值：DecodeStatus，表示需要更多数据、解析成功或协议错误；大量粘包请使用带 offset 的重载
     */
     DecodeStatus feed(const ByteBuffer& data, Frame& frame);
 
     /*
         函数：feed
-        参数：data：本次读取的完整字节块；offset：已消费位置，由调用方在新字节块开始时置 0；frame：解析成功后写入的帧
+        传参：data：本次读取的完整字节块；offset：已消费位置，由调用方在新字节块开始时置 0；frame：解析成功后写入的帧
         功能：从 data 的 offset 处消费至多一个完整帧；调用方在 offset 小于 data.size() 时继续调用以处理粘连帧
-        返回：DecodeStatus；FRAME_READY 时 offset 指向该帧末尾，NEED_MORE 时该字节块已消费完并暂存部分帧
+        返回值：DecodeStatus；FRAME_READY 时 offset 指向该帧末尾，NEED_MORE 时该字节块已消费完并暂存部分帧
     */
     DecodeStatus feed(const ByteBuffer& data, std::size_t& offset, Frame& frame);
 
     /*
         函数：encode
-        参数：frame：需要发送的完整帧
+        传参：frame：需要发送的完整帧
         功能：将协议帧编码为网络字节序的连续字节
-        返回：编码后的字节；编码失败时返回空结果
+        返回值：编码后的字节；编码失败时返回空结果
     */
     ByteBuffer encode(const Frame& frame) const;
 
     /*
         函数：reset
-        参数：无
+        传参：无
         功能：清空尚未组成完整帧的输入数据
-        返回：无
+        返回值：无
     */
     void reset();
 };

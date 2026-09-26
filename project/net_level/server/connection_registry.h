@@ -4,7 +4,8 @@
 
 /*
     模块名：连接注册表
-    功能描述：维护连接 ID 到连接快照/关闭任务的跨 Reactor 管理边界，不直接暴露 socket fd。
+    模块地位：定义跨 Reactor 连接查询与关闭管理的接口边界。
+    模块功能描述：维护连接 ID 到连接快照/关闭任务的跨 Reactor 管理边界，不直接暴露 socket fd。
 */
 
 #include "../common/net_types.h"
@@ -14,6 +15,7 @@ namespace mydb::net {
 
 /*
     类型名：ConnectionSnapshot
+    地位：ConnectionRegistry 对外提供的连接状态只读结果。
     功能：表示某个连接在指定时刻的只读管理快照。
 */
 struct ConnectionSnapshot {
@@ -25,6 +27,7 @@ struct ConnectionSnapshot {
 
 /*
     类名：ConnectionRegistry
+    地位：NetworkServer 与各 Reactor 之间的跨连接管理边界。
     功能：提供跨 Reactor 的连接查询和关闭管理边界。
         - 保存连接 ID 到所属 Reactor 的映射。
         - 生成只读连接快照。
@@ -38,25 +41,25 @@ private:
 public:
     /*
         函数：~ConnectionRegistry
-        参数：无
+        传参：无
         功能：销毁连接注册表
-        返回：无
+        返回值：无
     */
     virtual ~ConnectionRegistry() = default;
 
     /*
         函数：list
-        参数：无
+        传参：无
         功能：读取当前连接的只读快照
-        返回：连接快照列表
+        返回值：连接快照列表
     */
     virtual std::vector<ConnectionSnapshot> list() const = 0;
 
     /*
         函数：kill
-        参数：connectionId：待关闭连接标识
+        传参：connectionId：待关闭连接标识
         功能：向连接所属 Reactor 投递立即关闭任务
-        返回：是否成功找到并投递
+        返回值：是否成功找到并投递
     */
     virtual bool kill(ConnectionId connectionId) = 0;
 };

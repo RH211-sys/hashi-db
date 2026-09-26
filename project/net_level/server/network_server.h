@@ -4,7 +4,8 @@
 
 /*
     模块名：网络服务端
-    功能描述：组装 Acceptor、ReactorGroup、连接注册表和命令执行器，提供服务生命周期内部实现。
+    模块地位：网络服务对外控制器背后的生命周期实现模块。
+    模块功能描述：组装 Acceptor、ReactorGroup 和命令执行器，提供服务生命周期内部实现。
 */
 
 #include "../common/net_types.h"
@@ -19,10 +20,11 @@
 
 namespace mydb::net {
 
-class TlsServerContext;
+class TlsServerContext;                             // TLS 上下文类型：由 TLS 传输和网络服务共享的配置对象
 
 /*
     类型名：ServerConfig
+    地位：网络服务启动时由上层提供的配置契约。
     功能：保存网络服务端的监听、线程、连接、帧大小和 TLS 配置。
 */
 struct ServerConfig {
@@ -40,6 +42,7 @@ struct ServerConfig {
 
 /*
     类名：NetworkServer
+    地位：网络服务控制门面背后的内部生命周期编排者。
     功能：实现网络服务端内部生命周期编排。
         - 组装 Acceptor、ReactorGroup、连接注册表和命令执行器。
         - 启动和停止监听器及事件循环。
@@ -63,45 +66,64 @@ private:
 public:
     /*
         函数：NetworkServer
-        参数：config：服务端配置；executor：命令执行器
+        传参：config：服务端配置；executor：命令执行器
         功能：创建网络服务端并保存运行依赖
-        返回：无
+        返回值：无
     */
     NetworkServer(ServerConfig config, std::shared_ptr<ICommandExecutor> executor);
+
+    /*
+        函数：~NetworkServer
+        传参：无
+        功能：停止服务并释放服务端持有的资源
+        返回值：无
+    */
     ~NetworkServer();
 
+    /*
+        函数：NetworkServer 复制构造
+        传参：源对象：待复制的网络服务器
+        功能：禁止复制监听器、Reactor 组和运行状态
+        返回值：无
+    */
     NetworkServer(const NetworkServer&) = delete;
+    /*
+        函数：NetworkServer 复制赋值
+        传参：源对象：待复制赋值的网络服务器
+        功能：禁止替换监听器、Reactor 组和运行状态
+        返回值：赋值目标引用类型；该函数已删除，不可调用
+    */
     NetworkServer& operator=(const NetworkServer&) = delete;
 
     /*
         函数：start
-        参数：无
+        传参：无
         功能：启动 Acceptor 和 ReactorGroup
-        返回：是否启动成功
+        返回值：是否启动成功
     */
     bool start();
 
     /*
         函数：stop
-        参数：无
+        传参：无
         功能：停止接收新连接并立即关闭网络服务
-        返回：无
+        返回值：无
     */
     void stop();
 
     /*
         函数：wait
-        参数：无
-        功能：等待网络服务线程退出
-        返回：无
+        传参：无
+        功能：等待网络服务线程退出；线程通常已由 stop() 同步回收
+        返回值：无
     */
     void wait();
 
     /*
         函数：getState
-        参数：无
+        传参：无
         功能：读取网络服务当前状态
-        返回：ServerState
+        返回值：ServerState
     */
     ServerState getState() const;
 };

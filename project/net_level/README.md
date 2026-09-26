@@ -11,27 +11,27 @@ Network Controller -> NetworkServer -> Acceptor -> ReactorGroup
 ## 当前实现范围
 
 - 协议层：24 字节 MYDB 固定头、TLV 编解码、增量拆包/粘包和命令字段校验。
-- Linux 传输：非阻塞 TCP、level-triggered epoll、eventfd 跨线程唤醒；Connection 固定由一个 Reactor 管理。
-- 连接处理：每连接仅有一个业务请求在途，后续完整帧保留在有界输入缓冲中；异步 completion 回投 owner Reactor；关闭释放客户端容量槽。
-- 服务管理：仅实现 Linux 本地明文 TCP；TLS 未实现且 `tlsRequired` 默认为 true，因此当前默认安全配置拒绝启动。开发时须同时显式设置 `tlsRequired=false` 与 `allowPlaintextForDevelopment=true`；非回环绑定还必须显式设置 `allowInsecureRemote=true`。回环仅接受数字字面地址 `127.0.0.1`、`::1`，不信任主机名。
+- Linux 传输：非阻塞 TCP 与 OpenSSL TLS、水平触发 epoll、eventfd 跨线程唤醒；每个 Connection 固定由一个 Reactor 管理。
+- 连接处理：同一连接最多一个业务请求在途，后续完整请求进入有界流水线；完成结果回投原 Reactor，由所属事件循环更新连接和发送响应。
+- 服务管理：TLS 默认必需，证书链和私钥在启动时装载并校验；明文仅在显式启用开发许可后开放，非回环监听还必须显式允许远程不安全连接。回环地址使用数字字面形式校验，不信任主机名。
+- 停服语义：服务停止时停止接收新连接，立即关闭已有连接并丢弃尚未执行的 Reactor 任务，不执行停服排空。
 - Windows 仅保留协议/接口可编译方向，网络服务端实现目标为 Linux。
 
 ## 背压与停止契约
 
-1. 请求队列（每连接 pipeline）已满时，超出的后续请求直接丢弃；连接只暂停读取，不等待、不扩容。
+1. 单连接流水线达到配置上限时暂停读取；已有请求按序完成、队列腾出容量后再恢复读取。
 2. 每连接同一时刻最多一个业务请求在途，以保证同连接响应顺序。
-3. Reactor 的三类入队队列都有硬上限：通用任务、控制任务、完成结果。队列满时丢弃后续入队项。
-4. 完成结果队列满时放弃该响应，并关闭对应连接；连接不会被留在“等待完成”的中间状态。
-5. 优雅停止时不再接收新连接和新请求，但继续接收停止前已提交请求的完成结果，直到写完响应或超过排空时限；超时后强制关闭剩余连接。
-6. 非优雅停止立即丢弃未执行任务并关闭全部连接。
+3. Reactor 的通用任务、控制任务和完成结果队列均有容量上限；普通任务或控制任务队列满时拒绝新任务。
+4. 完成结果队列满时放弃该结果并安排关闭对应连接，避免连接无限等待。
+5. 服务统一采用立即停止：不等待业务排空或响应写完，连接和未执行任务由停服流程清理。
 
 ## 重要限制
 
-1. v1 TLV `field_id` 数值见 `command/protocol_fields.h`；此表是实现契约，尚待协议初审确认。响应共用该字段表中的 `STATUS_CODE` 和 `MESSAGE`。
-2. 连接认证/ACL 目前没有认证提供者；客户端业务命令在认证前被拒绝。连接超时、全局在途背压、连接管理快照和 CLIENT_LIST/CLIENT_KILL 业务处理尚未实现（仅解析器识别相应 opcode/schema）。
-3. 存储 Controller 的 future 没有标准 C++20 continuation；桥接必须在独立、有界 worker 上等待，不得在 Reactor 线程等待。若某 wire 类型没有已注册且往返一致的 codec，该类型读写应返回 `TYPE_NOT_REGISTERED`，不可直接把序列化私有格式暴露为协议。
-4. 不得将 `project/net_level/*.cpp` 无条件链接进存储测试可执行文件；应建立独立网络 core/test CMake target。
-5. `StorageControllerExecutor` 会引用存储层 `Controller` 符号；只使用协议/连接核心的网络测试应链接 `mydb_net_core`，涉及服务端装配的测试需要同时提供存储层编译产物。
+1. v1 TLV `field_id` 数值见 `command/protocol_fields.h`；该表是网络字段编号契约，协议语义仍需随协议设计同步维护。
+2. 当前没有真实认证提供者或 ACL；认证请求的校验应由执行层承担，连接会在认证成功响应后更新会话身份。`CLIENT_LIST`、`CLIENT_KILL` 虽可解析，但当前执行器不提供其业务处理；连接注册表接口尚未接入服务端装配。
+3. 阶段性 `StorageControllerExecutor` 支持 PING/QUIT，并将 DELETE、PERSIST、FLUSH、REWRITE 接入存储 Controller；GET、ADD、UPDATE 因网络值类型 codec 未注册而返回 `TYPE_NOT_REGISTERED`。HELLO/AUTH 和未实现命令需由正式执行层补齐。
+4. 存储 Controller 的 future 没有标准 C++20 continuation；桥接在独立、有界 worker 上等待，不得在 Reactor 线程等待。不可将存储层私有序列化格式直接暴露为网络值格式。
+5. 网络目标独立于存储测试默认构建；纯协议/连接测试链接 `mydb_net_core`，服务端装配测试还需提供存储桥接依赖。
 
 ## 构建方向
 
@@ -45,3 +45,7 @@ Network Controller -> NetworkServer -> Acceptor -> ReactorGroup
 | `mydb_net` | 聚合接口目标，链接 `mydb_net_linux` 与 `mydb_net_storage_bridge` | 继承上两行 |
 
 存储桥接单独成目标，是为了让纯网络目标不被拖上存储层与 cereal 依赖；cereal 搜索路径只挂在桥接目标上（PRIVATE），不向消费方传播。
+
+## 对接文档
+
+- [网络层接口文档](../../doc/arch/net_doc/实现阶段/二轮开发/接口文档.md)：说明网络请求、执行器回调与结构化响应之间的契约。

@@ -27,6 +27,7 @@ using ConnectionCompletionPoster = std::function<void(CommandResponse)>; // 完�
 
 /*
     类名：Connection
+    地位：单个客户端连接的状态与请求顺序所有者。
     功能：管理单个客户端连接。
         - 非阻塞读取并按帧解析输入，最多在途一个业务请求。
         - 把结构化响应编码为输出缓冲，按预算写出。
@@ -37,6 +38,10 @@ using ConnectionCompletionPoster = std::function<void(CommandResponse)>; // 完�
 */
 class Connection {
 private:
+    /*
+        地位：等待前序请求处理完成后生成的协议错误记录。
+        功能：保存错误响应所需的请求标识、命令码、状态和说明。
+    */
     struct PendingProtocolError {
         RequestId requestId;                       // 请求标识：对应无法解析或校验的帧
         Opcode opcode;                              // 命令码：用于构造关联错误响应
@@ -44,10 +49,14 @@ private:
         std::string message;                        // 错误说明：有界输出给客户端
     };
 
+    /*
+        地位：Connection 内部的传输操作等待状态。
+        功能：记录 TLS 非阻塞交叉读写需要重试的操作方向。
+    */
     enum class PendingTransportOperation : std::uint8_t {
-        NONE,
-        READ,
-        WRITE
+        NONE,                                       // 无挂起操作：当前不需要等待交叉 I/O 重试
+        READ,                                       // 读取挂起：等待 TLS 读取所需的事件就绪
+        WRITE                                       // 写入挂起：等待 TLS 写入所需的事件就绪
     };
 
     ConnectionId id;                                   // 连接标识：进程内唯一
@@ -89,31 +98,152 @@ private:
     friend class ReactorGroup;
     friend class ConnectionRegistry;
 
+    /*
+        函数：dispatchNext
+        传参：executor：处理结构化命令的执行器
+        功能：按连接顺序校验并派发队首请求
+        返回值：无
+    */
     void dispatchNext(ICommandExecutor& executor);
+
+    /*
+        函数：processInput
+        传参：executor：处理结构化命令的执行器
+        功能：增量解析暂存输入并处理其中的完整帧
+        返回值：输入处理期间连接是否仍可用
+    */
     bool processInput(ICommandExecutor& executor);
+
+    /*
+        函数：handleFrame
+        传参：frame：完整协议帧；executor：处理结构化命令的执行器
+        功能：校验并解析帧，将请求纳入当前连接的处理顺序
+        返回值：帧处理期间连接是否仍可用
+    */
     bool handleFrame(Frame frame, ICommandExecutor& executor);
+
+    /*
+        函数：queueProtocolError
+        传参：requestId：出错请求标识；opcode：命令码；error：错误分类；message：错误说明
+        功能：生成关联协议错误响应并安排连接关闭
+        返回值：无
+    */
     void queueProtocolError(RequestId requestId, Opcode opcode, ErrorCode error, std::string message);
+
+    /*
+        函数：retryPendingRead
+        传参：bytesRead：输出本次读取的字节数
+        功能：按传输层要求重试尚未完成的读取操作
+        返回值：传输操作结果
+    */
     TransportResult retryPendingRead(std::size_t& bytesRead);
+
+    /*
+        函数：retryPendingWrite
+        传参：bytesWritten：输出本次写出的字节数
+        功能：按传输层要求重试尚未完成的写入操作
+        返回值：传输操作结果
+    */
     TransportResult retryPendingWrite(std::size_t& bytesWritten);
+
+    /*
+        函数：interestEvents
+        传参：无
+        功能：汇总当前连接需要监听的传输事件
+        返回值：Poller 事件位掩码
+    */
     std::uint32_t interestEvents() const;
 
 public:
+    /*
+        函数：Connection
+        传参：id：连接标识；ownerReactor：所属 Reactor；transport：连接传输；maxPipelineRequests：流水线上限；peer：对端地址；maxFrameBytes：帧上限；generation：连接代际；releaseSlot：连接槽位释放回调；completionPoster：完成结果投递回调
+        功能：创建连接并接管传输和连接生命周期依赖
+        返回值：无
+    */
     Connection(ConnectionId id, ReactorId ownerReactor, std::unique_ptr<Transport> transport,
                std::size_t maxPipelineRequests, Endpoint peer = {},
                std::uint32_t maxFrameBytes = DEFAULT_MAX_FRAME_BYTES,
                std::uint64_t generation = 0, std::function<void()> releaseSlot = {},
-               ConnectionCompletionPoster completionPoster = {});
+                ConnectionCompletionPoster completionPoster = {});
+
+    /*
+        函数：~Connection
+        传参：无
+        功能：关闭连接并释放其传输及缓冲资源
+        返回值：无
+    */
     ~Connection();
 
+    /*
+        函数：Connection 复制构造
+        传参：源对象：待复制的连接状态
+        功能：禁止复制连接缓冲、请求队列和传输所有权
+        返回值：无
+    */
     Connection(const Connection&) = delete;
+    /*
+        函数：Connection 复制赋值
+        传参：源对象：待复制赋值的连接状态
+        功能：禁止替换 Reactor 线程独占的连接状态
+        返回值：赋值目标引用类型；该函数已删除，不可调用
+    */
     Connection& operator=(const Connection&) = delete;
 
+    /*
+        函数：onReadable
+        传参：executor：命令执行器；readBudget：本次读取预算
+        功能：读取并解析连接输入，按流水线上限暂存请求
+        返回值：无
+    */
     void onReadable(ICommandExecutor& executor, std::size_t readBudget);
+
+    /*
+        函数：onPeerHalfClose
+        传参：无
+        功能：记录对端半关闭并安排已接收请求和响应的收尾
+        返回值：无
+    */
     void onPeerHalfClose();
+
+    /*
+        函数：onWritable
+        传参：writeBudget：本次写出预算
+        功能：按顺序写出已编码响应并更新连接状态
+        返回值：无
+    */
     void onWritable(std::size_t writeBudget);
+
+    /*
+        函数：complete
+        传参：response：执行层返回的结构化结果
+        功能：关联当前在途请求并生成有序网络响应
+        返回值：无
+    */
     void complete(CommandResponse response);
+
+    /*
+        函数：close
+        传参：无
+        功能：关闭连接并清理该连接持有的请求与传输资源
+        返回值：无
+    */
     void close();
+
+    /*
+        函数：getId
+        传参：无
+        功能：读取连接标识
+        返回值：当前连接标识
+    */
     ConnectionId getId() const;
+
+    /*
+        函数：getState
+        传参：无
+        功能：读取连接生命周期状态
+        返回值：当前连接状态
+    */
     ConnectionState getState() const;
 };
 

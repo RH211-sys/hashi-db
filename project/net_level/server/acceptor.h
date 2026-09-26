@@ -4,7 +4,8 @@
 
 /*
     模块名：连接接收器
-    功能描述：监听 TCP 地址、接受新连接并将连接分派到 ReactorGroup，不负责客户端协议处理。
+    模块地位：NetworkServer 与 ReactorGroup 之间的新连接接入模块。
+    模块功能描述：监听 TCP 地址、接受新连接并将连接分派到 ReactorGroup，不负责客户端协议处理。
 */
 
 #include "../common/net_types.h"
@@ -16,12 +17,13 @@
 
 namespace mydb::net {
 
-using ClientSlotRelease = std::function<void()>; // 槽位释放回调：连接关闭时调用一次
+using ClientSlotRelease = std::function<void()>; // 槽位释放回调：归还客户端连接槽位，至多调用一次
 using AcceptedConnection = std::function<void(std::unique_ptr<Transport> transport, const Endpoint& peer,
-                                               ClientSlotRelease releaseSlot)>; // 接受回调：接管 transport 和连接槽
+                                               ClientSlotRelease releaseSlot)>; // 接收回调：交接传输、对端地址和槽位释放动作
 
 /*
     类名：Acceptor
+    地位：NetworkServer 与新建客户端 socket 之间的监听接入模块。
     功能：管理监听端点并接收新的 TCP 连接。
         - 创建和关闭监听 socket。
         - 循环 accept 新连接并执行回调。
@@ -44,25 +46,25 @@ private:
 public:
     /*
         函数：Acceptor
-        参数：endpoint：监听地址；backlog：监听队列长度；onAccepted：新连接回调
+        传参：endpoint：监听地址；backlog：监听队列长度；onAccepted：新连接回调
         功能：创建监听接收器配置
-        返回：无
+        返回值：无
     */
     Acceptor(Endpoint endpoint, std::uint32_t backlog, AcceptedConnection onAccepted);
 
     /*
         函数：start
-        参数：无
+        传参：无
         功能：创建监听 socket 并开始接受连接
-        返回：是否启动成功
+        返回值：是否启动成功
     */
     bool start();
 
     /*
         函数：stop
-        参数：无
+        传参：无
         功能：停止接受连接并关闭监听资源
-        返回：无
+        返回值：无
     */
     void stop();
 };
