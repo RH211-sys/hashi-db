@@ -19,20 +19,20 @@
 namespace mydb::net {
 namespace {
 
-constexpr std::uint16_t FIELD_VERSION = fieldId(FieldId::PROTOCOL_VERSION); // 字段编号：协议版本
-constexpr std::uint16_t FIELD_FEATURES = fieldId(FieldId::FEATURE_BITS); // 字段编号：协商特性位
-constexpr std::uint16_t FIELD_CLIENT_NAME = fieldId(FieldId::CLIENT_NAME); // 字段编号：客户端名称
-constexpr std::uint16_t FIELD_USERNAME = fieldId(FieldId::USERNAME); // 字段编号：认证用户名
-constexpr std::uint16_t FIELD_PASSWORD = fieldId(FieldId::PASSWORD); // 字段编号：认证口令
-constexpr std::uint16_t FIELD_PAYLOAD = fieldId(FieldId::PAYLOAD); // 字段编号：命令负载
-constexpr std::uint16_t FIELD_KEY = fieldId(FieldId::KEY); // 字段编号：存储键
-constexpr std::uint16_t FIELD_TYPE = fieldId(FieldId::TYPE_NAME); // 字段编号：存储类型名
-constexpr std::uint16_t FIELD_VALUE = fieldId(FieldId::VALUE); // 字段编号：存储值
-constexpr std::uint16_t FIELD_TTL = fieldId(FieldId::TTL); // 字段编号：生存时间
-constexpr std::uint16_t FIELD_SCOPE = fieldId(FieldId::SCOPE); // 字段编号：操作范围
-constexpr std::uint16_t FIELD_CONNECTION_ID = fieldId(FieldId::CONNECTION_ID); // 字段编号：连接标识
-constexpr std::uint16_t FIELD_STATUS_CODE = fieldId(FieldId::STATUS_CODE); // 字段编号：响应状态码
-constexpr std::uint16_t FIELD_MESSAGE = fieldId(FieldId::MESSAGE); // 字段编号：响应说明文本
+constexpr std::uint16_t FIELD_VERSION = fieldId(FieldId::PROTOCOL_VERSION);             // 字段编号：协议版本
+constexpr std::uint16_t FIELD_FEATURES = fieldId(FieldId::FEATURE_BITS);                // 字段编号：协商特性位
+constexpr std::uint16_t FIELD_CLIENT_NAME = fieldId(FieldId::CLIENT_NAME);              // 字段编号：客户端名称
+constexpr std::uint16_t FIELD_USERNAME = fieldId(FieldId::USERNAME);                    // 字段编号：认证用户名
+constexpr std::uint16_t FIELD_PASSWORD = fieldId(FieldId::PASSWORD);                    // 字段编号：认证口令
+constexpr std::uint16_t FIELD_PAYLOAD = fieldId(FieldId::PAYLOAD);                      // 字段编号：命令负载
+constexpr std::uint16_t FIELD_KEY = fieldId(FieldId::KEY);                              // 字段编号：存储键
+constexpr std::uint16_t FIELD_TYPE = fieldId(FieldId::TYPE_NAME);                       // 字段编号：存储类型名
+constexpr std::uint16_t FIELD_VALUE = fieldId(FieldId::VALUE);                          // 字段编号：存储值
+constexpr std::uint16_t FIELD_TTL = fieldId(FieldId::TTL);                              // 字段编号：生存时间
+constexpr std::uint16_t FIELD_SCOPE = fieldId(FieldId::SCOPE);                          // 字段编号：操作范围
+constexpr std::uint16_t FIELD_CONNECTION_ID = fieldId(FieldId::CONNECTION_ID);          // 字段编号：连接标识
+constexpr std::uint16_t FIELD_STATUS_CODE = fieldId(FieldId::STATUS_CODE);              // 字段编号：响应状态码
+constexpr std::uint16_t FIELD_MESSAGE = fieldId(FieldId::MESSAGE);                      // 字段编号：响应说明文本
 
 /*
     地位：协议字段定义表中的单字段约束。
@@ -76,9 +76,11 @@ struct OpcodeRules {
 constexpr std::array<FieldRule, 3> HELLO_FIELDS{{
     ALL_FIELDS[0], ALL_FIELDS[2], ALL_FIELDS[1]
 }}; // HELLO 规则：允许版本、客户端名称和特性位字段
+
 constexpr std::array<FieldRule, 2> AUTH_FIELDS{{
     ALL_FIELDS[3], ALL_FIELDS[4]
 }}; // AUTH 规则：要求用户名和口令字段
+
 constexpr std::array<FieldRule, 1> PING_FIELDS{{ALL_FIELDS[5]}}; // PING 规则：允许负载字段
 constexpr std::array<FieldRule, 0> NO_FIELDS{}; // 空规则：用于不接受字段的命令
 constexpr std::array<FieldRule, 1> KEY_FIELDS{{ALL_FIELDS[6]}}; // 键规则：要求存储键字段

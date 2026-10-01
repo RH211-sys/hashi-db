@@ -16,11 +16,11 @@
 namespace mydb::net {
 namespace {
 
-constexpr std::size_t FIXED_HEADER_SIZE = 24; // 固定头长度：MYDB 基础协议帧头字节数
-constexpr std::uint8_t KNOWN_FLAG_MASK = RESPONSE | ERROR | COMPRESSED | MORE; // 已知标志：协议帧头定义的全部标志位
-constexpr std::uint8_t UNSUPPORTED_FLAG_MASK = COMPRESSED | MORE; // 暂不支持标志：当前实现拒绝的压缩与续帧标志
-constexpr std::size_t TLV_HEADER_SIZE = 8; // TLV 头长度：字段编号、类型、保留位和长度字段总字节数
-constexpr std::size_t MAX_NESTED_DEPTH = 8; // 嵌套上限：允许解析的 TLV 最大递归层数
+constexpr std::size_t FIXED_HEADER_SIZE = 24;                                       // 固定头长度：MYDB 基础协议帧头字节数
+constexpr std::uint8_t KNOWN_FLAG_MASK = RESPONSE | ERROR | COMPRESSED | MORE;      // 已知标志：协议帧头定义的全部标志位
+constexpr std::uint8_t UNSUPPORTED_FLAG_MASK = COMPRESSED | MORE;                   // 暂不支持标志：当前实现拒绝的压缩与续帧标志
+constexpr std::size_t TLV_HEADER_SIZE = 8;                                          // TLV 头长度：字段编号、类型、保留位和长度字段总字节数
+constexpr std::size_t MAX_NESTED_DEPTH = 8;                                         // 嵌套上限：允许解析的 TLV 最大递归层数
 
 /*
     函数：readU16
@@ -224,10 +224,10 @@ bool parseBody(const std::uint8_t* data, std::size_t length, std::vector<TlvFiel
             return false;
         }
 
-        const std::uint16_t fieldId = readU16(data + offset); // 字段编号：当前 TLV 的 wire field_id
-        const std::uint8_t rawType = data[offset + 2]; // 原始类型：当前字段头中的 wire type 数值
-        const std::uint8_t reserved = data[offset + 3]; // 保留位：必须为零的字段头字节
-        const std::uint32_t valueLength = readU32(data + offset + 4); // 值长度：当前字段值的字节数
+        const std::uint16_t fieldId = readU16(data + offset);               // 字段编号：当前 TLV 的 wire field_id
+        const std::uint8_t rawType = data[offset + 2];                      // 原始类型：当前字段头中的 wire type 数值
+        const std::uint8_t reserved = data[offset + 3];                     // 保留位：必须为零的字段头字节
+        const std::uint32_t valueLength = readU32(data + offset + 4);       // 值长度：当前字段值的字节数
         offset += TLV_HEADER_SIZE;
 
         if (reserved != 0 || !isKnownFieldType(rawType) ||
@@ -265,9 +265,9 @@ DecodeStatus FrameCodec::feed(const ByteBuffer& data, std::size_t& offset, Frame
     }
     // 只追加完成当前帧所需的字节，避免一次读取多个粘连帧时保留无界输入缓冲。
     while (inputBuffer.size() < FIXED_HEADER_SIZE && offset < data.size()) {
-        const std::size_t needed = FIXED_HEADER_SIZE - inputBuffer.size(); // 所需长度：补齐固定帧头还缺少的字节数
-        const std::size_t available = data.size() - offset; // 可用长度：当前输入块尚未消费的字节数
-        const std::size_t count = std::min(needed, available); // 复制长度：本轮加入帧头缓冲的字节数
+        const std::size_t needed = FIXED_HEADER_SIZE - inputBuffer.size();          // 所需长度：补齐固定帧头还缺少的字节数
+        const std::size_t available = data.size() - offset;                         // 可用长度：当前输入块尚未消费的字节数
+        const std::size_t count = std::min(needed, available);                      // 复制长度：本轮加入帧头缓冲的字节数
         inputBuffer.insert(inputBuffer.end(), data.begin() + static_cast<std::ptrdiff_t>(offset),
                            data.begin() + static_cast<std::ptrdiff_t>(offset + count));
         offset += count;
@@ -284,13 +284,13 @@ DecodeStatus FrameCodec::feed(const ByteBuffer& data, std::size_t& offset, Frame
         return DecodeStatus::INVALID_FRAME;
     }
 
-    const std::uint8_t version = bytes[4]; // 协议版本：从固定帧头提取的版本号
-    const std::uint8_t flags = bytes[5]; // 帧标志：从固定帧头提取的响应和控制标志
-    const std::uint16_t opcode = readU16(bytes + 6); // 命令码：从固定帧头提取的操作编号
-    const std::uint16_t headerLength = readU16(bytes + 8); // 帧头长度：当前协议固定头的字节数
-    const std::uint32_t bodyLength = readU32(bytes + 10); // Body 长度：后续 TLV 字段区的字节数
-    const std::uint64_t requestId = readU64(bytes + 14); // 请求标识：关联本帧请求与响应
-    const std::uint16_t reserved = readU16(bytes + 22); // 保留字段：协议规定必须为零的帧头值
+    const std::uint8_t version = bytes[4];                      // 协议版本：从固定帧头提取的版本号
+    const std::uint8_t flags = bytes[5];                        // 帧标志：从固定帧头提取的响应和控制标志
+    const std::uint16_t opcode = readU16(bytes + 6);            // 命令码：从固定帧头提取的操作编号
+    const std::uint16_t headerLength = readU16(bytes + 8);      // 帧头长度：当前协议固定头的字节数
+    const std::uint32_t bodyLength = readU32(bytes + 10);       // Body 长度：后续 TLV 字段区的字节数
+    const std::uint64_t requestId = readU64(bytes + 14);        // 请求标识：关联本帧请求与响应
+    const std::uint16_t reserved = readU16(bytes + 22);         // 保留字段：协议规定必须为零的帧头值
 
     if (!validateHeaderValues(version, flags, headerLength) || reserved != 0) {
         // 帧头字段或保留值无效，清空输入缓冲并报告非法帧。

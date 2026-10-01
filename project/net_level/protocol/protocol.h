@@ -17,7 +17,7 @@ namespace mydb::net {
 
 constexpr std::uint16_t PROTOCOL_VERSION = 1;                         // 当前协议版本：固定头和字段语义的版本号
 constexpr std::uint16_t BASE_HEADER_LENGTH = 24;                      // 基础头长度：固定头在线上的字节数
-constexpr std::uint32_t DEFAULT_MAX_FRAME_BYTES = 16U * 1024U * 1024U; // 默认帧上限：限制单帧内存分配
+constexpr std::uint32_t DEFAULT_MAX_FRAME_BYTES = 16U * 1024U * 1024U; // 默认帧上限：限制单帧内存分，16MB
 
 /*
     类型名：Opcode
@@ -31,13 +31,13 @@ enum class Opcode : std::uint16_t {
     GET = 0x0010,                                // 查询：读取指定 key 的值
     ADD = 0x0011,                                // 新增：创建一个不存在的 key
     UPDATE = 0x0012,                             // 修改：替换一个已存在的 key
-    DELETE_DATA = 0x0013,                       // 删除：删除指定 key
+    DELETE_DATA = 0x0013,                        // 删除：删除指定 key
     PERSIST = 0x0020,                            // 持久化：将指定数据或全部脏数据刷盘
     FLUSH = 0x0021,                              // 刷盘：执行过期清理和持久化
     REWRITE = 0x0022,                            // 重写：整理磁盘文件和空洞
     STATS = 0x0030,                              // 统计：读取服务或存储统计
     CLIENT_LIST = 0x0031,                        // 客户端列表：读取连接快照
-    CLIENT_KILL = 0x0032                        // 客户端踢出：按 ConnectionId 关闭连接
+    CLIENT_KILL = 0x0032                         // 客户端踢出：按 ConnectionId 关闭连接
 };
 
 /*

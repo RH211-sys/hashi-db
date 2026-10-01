@@ -213,13 +213,13 @@ void StorageControllerExecutor::execute(CommandRequest request, CommandCompletio
         return;
     }
 
-    const std::string key = keyFrom(request);      // 存储键：复制请求键供异步任务使用
-    const ConnectionId connectionId = request.connectionId; // 连接标识：用于线程池拒绝时构造关联响应
-    const RequestId requestId = request.requestId; // 请求标识：用于线程池拒绝时构造关联响应
-    auto completionHolder = std::make_shared<CommandCompletion>(std::move(completion)); // 完成回调：在调用方与工作任务间共享
+    const std::string key = keyFrom(request);                                               // 存储键：复制请求键供异步任务使用
+    const ConnectionId connectionId = request.connectionId;                                 // 连接标识：用于线程池拒绝时构造关联响应
+    const RequestId requestId = request.requestId;                                          // 请求标识：用于线程池拒绝时构造关联响应
+    auto completionHolder = std::make_shared<CommandCompletion>(std::move(completion));     // 完成回调：在调用方与工作任务间共享
     const bool accepted = workerPool->submit([this, request = std::move(request), key = std::move(key),
-                                              completionHolder]() mutable { // request、key、completionHolder：任务请求、存储键和完成回调
-        CommandResponse response;                  // 响应对象：保存存储任务结果和原请求关联标识
+                                              completionHolder]() mutable {                 // request、key、completionHolder：任务请求、存储键和完成回调
+        CommandResponse response;                                                           // 响应对象：保存存储任务结果和原请求关联标识
         response.connectionId = request.connectionId;
         response.requestId = request.requestId;
         try {
